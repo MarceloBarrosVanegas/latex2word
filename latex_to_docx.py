@@ -1985,6 +1985,9 @@ def parse_body(doc: Document, source: str, base_dir: Path):
     labels = pre_scan_labels(body)
     body = resolve_refs(body, labels)
 
+    # ── strip fancyhdr commands that leak into body text ──────────────────────
+    body = strip_fancyhdr_cmds(body)
+
     # ── scan bibliography ─────────────────────────────────────────────────────
     bib_map, bib_inner, body, bib_title = pre_scan_bibliography(body)
 
@@ -2006,6 +2009,26 @@ def parse_body(doc: Document, source: str, base_dir: Path):
             run.font.bold = True
             run.font.color.rgb = C_BLACK
         _render_bibliography(doc, bib_inner, bib_map)
+
+
+def strip_fancyhdr_cmds(text: str) -> str:
+    """Remove fancyhdr setup commands that leak into the document body."""
+    # Single-line fancyhdr / header-footer commands
+    text = re.sub(
+        r"(?m)^\s*\\(?:pagestyle|thispagestyle|fancyhf|rhead|lhead|chead|fancyfoot|rfoot|lfoot|cfoot|headrulewidth|footrulewidth)\b.*(?:\n|\r\n?)",
+        "", text,
+    )
+    # \renewcommand{\headrulewidth}{...} or {\footrulewidth}{...}
+    text = re.sub(
+        r"(?m)^\s*\\renewcommand\s*\*?\s*\{\s*\\(?:headrulewidth|footrulewidth)\s*\}\s*\{[^}]*\}\s*(?:\n|\r\n?)",
+        "", text,
+    )
+    # \setlength\headheight{...}
+    text = re.sub(
+        r"(?m)^\s*\\setlength\s*\\headheight\s*\{[^}]*\}\s*(?:\n|\r\n?)",
+        "", text,
+    )
+    return text
 
 
 # Significant structural tokens
