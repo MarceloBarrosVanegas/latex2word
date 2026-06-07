@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.docx
+*.tex
+expanded_debug.tex
+*.log
+*.aux
+*.out
+*.toc
+*.tmp

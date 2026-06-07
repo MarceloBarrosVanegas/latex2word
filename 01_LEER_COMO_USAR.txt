@@ -1,0 +1,44 @@
+═══════════════════════════════════════════════════════════════
+CONVERSOR LaTeX A WORD - Galapagos Water Project
+═══════════════════════════════════════════════════════════════
+
+COMO USAR:
+──────────
+1. Edita "convertir.bat":
+      SET TEX_FILE=linea_base_en
+
+2. Guarda y haz doble clic en "convertir.bat"
+
+3. El archivo Word se guarda en esta misma carpeta
+   (latex_to_word_converter)
+
+═══════════════════════════════════════════════════════════════
+
+ACTUALIZAR INDICES EN WORD:
+───────────────────────────
+Al abrir el documento:
+
+1. Presiona Ctrl+A (selecciona TODO)
+2. Presiona F9 (actualiza campos)
+3. Selecciona "Update entire table"
+4. Haz clic en OK
+
+═══════════════════════════════════════════════════════════════
+
+SI EL LIST OF TABLES NO APARECE:
+────────────────────────────────
+Metodo manual:
+
+1. Ve a la pagina "LIST OF TABLES"
+2. Haz clic debajo del titulo
+3. Menu: REFERENCES → Insert Table of Authorities
+4. Haz clic en OK
+
+═══════════════════════════════════════════════════════════════
+
+ARCHIVOS GENERADOS:
+───────────────────
+- linea_base_en.docx (o el nombre que configuraste)
+- Se guarda en: latex_to_word_converter\
+
+═══════════════════════════════════════════════════════════════
