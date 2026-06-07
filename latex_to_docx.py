@@ -1986,7 +1986,7 @@ def parse_body(doc: Document, source: str, base_dir: Path):
     body = resolve_refs(body, labels)
 
     # ── scan bibliography ─────────────────────────────────────────────────────
-    bib_map, bib_inner, body = pre_scan_bibliography(body)
+    bib_map, bib_inner, body, bib_title = pre_scan_bibliography(body)
 
     # ── resolve \\cite{...} to numbers ───────────────────────────────────────
     body = resolve_cites(body, bib_map)
@@ -1996,6 +1996,15 @@ def parse_body(doc: Document, source: str, base_dir: Path):
 
     # ── render bibliography ───────────────────────────────────────────────────
     if bib_inner is not None:
+        doc.add_page_break()
+        if bib_title:
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            run = p.add_run(bib_title.upper())
+            run.font.name = FONT
+            run.font.size = Pt(16)
+            run.font.bold = True
+            run.font.color.rgb = C_BLACK
         _render_bibliography(doc, bib_inner, bib_map)
 
 
@@ -2121,16 +2130,16 @@ def resolve_refs(text: str, labels: dict) -> str:
     return text
 
 
-def pre_scan_bibliography(text: str) -> tuple[dict, str | None, str]:
+def pre_scan_bibliography(text: str) -> tuple[dict, str | None, str, str]:
     """
     Extract \\begin{thebibliography}...\\end{thebibliography} from text.
-    Returns (bib_map, bib_inner, text_without_bibliography).
+    Returns (bib_map, bib_inner, text_without_bibliography, bib_title).
     bib_map: {cite_key: number}
     """
     pattern = r"\\begin\{thebibliography\}\{[^}]*\}(.*?)\\end\{thebibliography\}"
     m = re.search(pattern, text, re.DOTALL)
     if not m:
-        return {}, None, text
+        return {}, None, text, ""
 
     bib_inner = m.group(1)
     text_without = text[:m.start()] + text[m.end():]
@@ -2143,7 +2152,18 @@ def pre_scan_bibliography(text: str) -> tuple[dict, str | None, str]:
             bib_map[key] = counter
             counter += 1
 
-    return bib_map, bib_inner, text_without
+    # Look for \\renewcommand{\\refname}{...} or \\renewcommand{\\bibname}{...}
+    # in the text before thebibliography
+    prefix = text[max(0, m.start()-500):m.start()]
+    title_m = re.search(r"\\renewcommand\{\\(?:refname|bibname)\}\{((?:[^{}]|\{[^{}]*\})*)\}", prefix)
+    bib_title = title_m.group(1) if title_m else "Referencias"
+
+    # Remove the \\renewcommand from text_without so it doesn't render as stray text
+    if title_m:
+        rc_pattern = r"\\renewcommand\{\\(?:refname|bibname)\}\{" + re.escape(title_m.group(1)) + r"\}"
+        text_without = re.sub(rc_pattern, "", text_without)
+
+    return bib_map, bib_inner, text_without, bib_title
 
 
 def resolve_cites(text: str, bib_map: dict) -> str:
@@ -2283,6 +2303,7 @@ def _walk(doc: Document, text: str, base_dir: Path):
         )
         if ch_m:
             flush()
+            doc.add_page_break()
             has_chapters = True
             sec_counters["chapter"] += 1
             sec_counters["section"] = 0
