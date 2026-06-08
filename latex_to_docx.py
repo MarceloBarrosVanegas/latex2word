@@ -1704,7 +1704,11 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
 
         raw = _expand_multicolumn(raw)
         cells = [c.strip() for c in raw.split("&")]
-        cells = [c for c in cells if c.strip() and not re.match(r"^p\{", c.strip())]
+        cells = [c for c in cells if not re.match(r"^p\{", c.strip())]
+        # Remove only trailing empty cells; keep leading/middle empty cells
+        # because they are needed for \multirow alignment
+        while cells and not cells[-1].strip():
+            cells.pop()
         
         # Filtrar filas de continuación (longtable)
         if cells and is_continuation_row_cells(cells):
