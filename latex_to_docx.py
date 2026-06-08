@@ -2200,6 +2200,76 @@ def pre_scan_labels(text: str) -> dict:
                 labels[label_m.group(1)] = str(eq_counter)
             pos = dm.end()
 
+    # Section / chapter labels
+    sec_counters = {"chapter": 0, "section": 0, "subsection": 0, "subsubsection": 0, "paragraph": 0}
+    has_chapters = bool(re.search(r"\\chapter\b", text))
+    appendix_pos = text.find("\\appendix")
+
+    sec_matches = list(re.finditer(
+        r"\\(chapter|section|subsection|subsubsection|paragraph)\*?\s*\{[^{}]*\}",
+        text
+    ))
+
+    for i, m in enumerate(sec_matches):
+        cmd = m.group(1)
+        start_pos = m.end()
+        end_pos = sec_matches[i + 1].start() if i + 1 < len(sec_matches) else len(text)
+
+        if cmd == "chapter":
+            sec_counters["chapter"] += 1
+            sec_counters["section"] = 0
+            sec_counters["subsection"] = 0
+            sec_counters["subsubsection"] = 0
+            sec_counters["paragraph"] = 0
+        elif cmd == "section":
+            sec_counters["section"] += 1
+            sec_counters["subsection"] = 0
+            sec_counters["subsubsection"] = 0
+            sec_counters["paragraph"] = 0
+        elif cmd == "subsection":
+            sec_counters["subsection"] += 1
+            sec_counters["subsubsection"] = 0
+            sec_counters["paragraph"] = 0
+        elif cmd == "subsubsection":
+            sec_counters["subsubsection"] += 1
+            sec_counters["paragraph"] = 0
+        elif cmd == "paragraph":
+            sec_counters["paragraph"] += 1
+
+        appendix_mode = appendix_pos != -1 and m.start() > appendix_pos
+
+        if not has_chapters:
+            if cmd == "section":
+                num_str = f"{sec_counters['section']}"
+            elif cmd == "subsection":
+                num_str = f"{sec_counters['section']}.{sec_counters['subsection']}"
+            elif cmd == "subsubsection":
+                num_str = f"{sec_counters['section']}.{sec_counters['subsection']}.{sec_counters['subsubsection']}"
+            elif cmd == "paragraph":
+                num_str = f"{sec_counters['section']}.{sec_counters['subsection']}.{sec_counters['subsubsection']}.{sec_counters['paragraph']}"
+            else:
+                num_str = ""
+        else:
+            ch_label = chr(ord('A') + sec_counters['chapter'] - 1) if appendix_mode else str(sec_counters['chapter'])
+            if cmd == "chapter":
+                num_str = ch_label
+            elif cmd == "section":
+                num_str = f"{ch_label}.{sec_counters['section']}"
+            elif cmd == "subsection":
+                num_str = f"{ch_label}.{sec_counters['section']}.{sec_counters['subsection']}"
+            elif cmd == "subsubsection":
+                num_str = f"{ch_label}.{sec_counters['section']}.{sec_counters['subsection']}.{sec_counters['subsubsection']}"
+            elif cmd == "paragraph":
+                num_str = f"{ch_label}.{sec_counters['section']}.{sec_counters['subsection']}.{sec_counters['subsubsection']}.{sec_counters['paragraph']}"
+            else:
+                num_str = ""
+
+        # Look for the first \label within a short window after the section command
+        search_end = min(end_pos, start_pos + 300)
+        label_m = re.search(r"\\label\{([^}]*)\}", text[start_pos:search_end])
+        if label_m and label_m.group(1) not in labels:
+            labels[label_m.group(1)] = num_str
+
     return labels
 
 
