@@ -2705,7 +2705,7 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                     fig_clean = strip_fmt(fig_cap_txt).replace('"', "'")
                     fig_caption = f"Figure {FIGURE_COUNTER[0]}: " + fig_clean
                     _run(cp, fig_caption,
-                         italic=True, size=PT_SMALL)
+                         italic=True, size=PT_SMALL, color=C_BLACK)
                     # Hidden TC field for List of Figures
                     tc_text = f"Figura {FIGURE_COUNTER[0]}\t{fig_clean}"
                     _add_tc_field(cp, tc_text, "F")
