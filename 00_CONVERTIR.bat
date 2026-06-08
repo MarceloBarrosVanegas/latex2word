@@ -68,8 +68,12 @@ echo    (Actualizar tabla completa)
 echo.
 echo 5. Haz clic en OK
 echo.
-echo 6. Repite el proceso si aparece otro cuadro
-echo    (hay 2 indices: Contenidos y Tablas)
+echo 6. Guarda el documento (Ctrl+S)
+echo.
+echo    La proxima vez que abras el archivo, los indices
+echo    ya apareceran actualizados sin ningun mensaje.
+echo.
+echo    Nota: hay 3 indices: Contenidos, Figuras y Tablas
 echo.
 echo ============================================
 pause

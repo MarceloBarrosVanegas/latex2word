@@ -117,79 +117,124 @@ def _add_page_number_field(run):
     run._r.append(fld_end)
 
 
-def add_toc(doc: Document, title: str = "TABLE OF CONTENTS"):
-    """
-    Insert a Table of Contents field.
-    Word will auto-populate it from heading styles when the document is opened.
-    User should press Ctrl+A then F9 to update fields, or use References > Update Table.
-    """
-    from docx.oxml import parse_xml
-    
-    # TOC Title
-    p = doc.add_paragraph()
-    run = _run(p, title, bold=True, size=13)
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    doc.add_paragraph()
+def _add_tc_field(paragraph, text: str, identifier: str):
+    """Add a hidden TC (Table of Contents Entry) field to a paragraph."""
+    safe_text = text.replace('"', "'")
 
-    # Create a simple paragraph that will contain the TOC field
+    run1 = paragraph.add_run()
+    fld_begin = OxmlElement("w:fldChar")
+    fld_begin.set(qn("w:fldCharType"), "begin")
+    run1._r.append(fld_begin)
+
+    run2 = paragraph.add_run()
+    instr = OxmlElement("w:instrText")
+    instr.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    instr.text = f' TC "{safe_text}" \\f {identifier} '
+    run2._r.append(instr)
+
+    run3 = paragraph.add_run()
+    fld_sep = OxmlElement("w:fldChar")
+    fld_sep.set(qn("w:fldCharType"), "separate")
+    run3._r.append(fld_sep)
+
+    run4 = paragraph.add_run()
+    fld_end = OxmlElement("w:fldChar")
+    fld_end.set(qn("w:fldCharType"), "end")
+    run4._r.append(fld_end)
+
+
+def _safe_page_break(doc: Document):
+    """Add a page break only if the document does not already end with one.
+    Also strips trailing empty paragraphs to avoid blank pages."""
+    # Remove trailing completely empty paragraphs (no text, no runs)
+    while doc.paragraphs:
+        last_p = doc.paragraphs[-1]
+        has_content = bool(last_p.text.strip()) or len(last_p.runs) > 0
+        if not has_content:
+            last_p._element.getparent().remove(last_p._element)
+        else:
+            break
+
+    # Check if the last paragraph already ends with a page break
+    if doc.paragraphs:
+        last_p = doc.paragraphs[-1]
+        for run in last_p.runs:
+            for br in run._r.findall(qn('w:br')):
+                if br.get(qn('w:type')) == 'page':
+                    return  # Already a page break, skip
+
+    doc.add_page_break()
+
+
+def _insert_toc_field(doc: Document, instr: str, title: str = "", placeholder: str = ""):
+    """Insert a Word TOC/LOT/LOF field."""
+    from docx.oxml import parse_xml
+
+    # NOTE: We intentionally do NOT set w:updateFields to true because that
+    # triggers a Word dialog on every open asking whether to update fields.
+    # The user can update once with Ctrl+A → F9, save, and the document
+    # will open cleanly afterwards.
+
+    if title:
+        p = doc.add_paragraph()
+        run = _run(p, title, bold=True, size=13)
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        doc.add_paragraph()
+
     toc_para = doc.add_paragraph()
     toc_para.paragraph_format.space_before = Pt(12)
     toc_para.paragraph_format.space_after = Pt(12)
-    
-    # Get the paragraph XML element
-    pPr = toc_para._p.get_or_add_pPr()
-    
-    # Create the field structure using the simplest approach
-    # This creates: { TOC \o "1-3" \h }
-    fld_elem = parse_xml(r'''
-        <w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-            <w:fldChar w:fldCharType="begin"/>
-        </w:r>
-    ''')
-    toc_para._p.append(fld_elem)
-    
-    instr_elem = parse_xml(r'''
-        <w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-            <w:instrText xml:space="preserve"> TOC \o "1-3" \h \z </w:instrText>
-        </w:r>
-    ''')
-    toc_para._p.append(instr_elem)
-    
-    sep_elem = parse_xml(r'''
-        <w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-            <w:fldChar w:fldCharType="separate"/>
-        </w:r>
-    ''')
-    toc_para._p.append(sep_elem)
-    
-    # Placeholder text explaining what to do
-    placeholder_elem = parse_xml(r'''
-        <w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-            <w:rPr>
-                <w:color w:val="808080"/>
-                <w:i/>
-            </w:rPr>
-            <w:t>No table of contents entries found. Right-click and select "Update Field" to generate.</w:t>
-        </w:r>
-    ''')
-    toc_para._p.append(placeholder_elem)
-    
-    end_elem = parse_xml(r'''
-        <w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-            <w:fldChar w:fldCharType="end"/>
-        </w:r>
-    ''')
-    toc_para._p.append(end_elem)
 
-    # Hint paragraph
-    doc.add_paragraph()
-    pn = doc.add_paragraph()
-    _run(pn, "Tip: Press Ctrl+A to select all, then F9 to update all fields", 
-         italic=True, color=C_GRAY, size=PT_SMALL)
+    toc_para._p.append(parse_xml(
+        f'<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f'<w:fldChar w:fldCharType="begin"/></w:r>'
+    ))
+    toc_para._p.append(parse_xml(
+        f'<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f'<w:instrText xml:space="preserve"> {instr} </w:instrText></w:r>'
+    ))
+    toc_para._p.append(parse_xml(
+        f'<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f'<w:fldChar w:fldCharType="separate"/></w:r>'
+    ))
+    ph_text = placeholder or "Right-click and select Update Field to generate."
+    toc_para._p.append(parse_xml(
+        f'<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f'<w:rPr><w:color w:val="808080"/><w:i/></w:rPr>'
+        f'<w:t>{ph_text}</w:t></w:r>'
+    ))
+    toc_para._p.append(parse_xml(
+        f'<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f'<w:fldChar w:fldCharType="end"/></w:r>'
+    ))
+
+
+def add_toc(doc: Document, title: str = "TABLE OF CONTENTS"):
+    """Insert a Table of Contents field (auto-updates on open)."""
+    _insert_toc_field(
+        doc, r'TOC \o "1-3" \h \z', title,
+        "No table of contents entries found. Right-click and select Update Field to generate."
+    )
+
+
+def add_lof(doc: Document, title: str = "LIST OF FIGURES"):
+    """Insert a List of Figures field (auto-updates on open)."""
+    _insert_toc_field(
+        doc, r'TOC \c "Figure" \h \z', title,
+        "No figure entries found. Right-click and select Update Field to generate."
+    )
+
+
+def add_lot(doc: Document, title: str = "LIST OF TABLES"):
+    """Insert a List of Tables field (auto-updates on open)."""
+    _insert_toc_field(
+        doc, r'TOC \c "Table" \h \z', title,
+        "No table entries found. Right-click and select Update Field to generate."
+    )
 
 def add_table_caption(doc: Document, caption_text: str, table_num: int = 0):
     """
-    Add a table caption - simple version, no special fields.
+    Add a table caption with a hidden TC field for Word's List of Tables.
     Format: Table X: Caption text
     """
     clean_caption = strip_fmt(caption_text).replace('"', "'")
@@ -207,6 +252,10 @@ def add_table_caption(doc: Document, caption_text: str, table_num: int = 0):
     r.font.size = Pt(PT_SMALL)
     r.font.name = FONT
     r.font.color.rgb = C_BLACK
+    
+    # Hidden TC field for List of Tables
+    tc_text = f"Tabla {table_num}\t{clean_caption}" if table_num > 0 else f"Tabla\t{clean_caption}"
+    _add_tc_field(p, tc_text, "T")
 
 
 def add_list_of_tables(doc: Document, title: str = "LIST OF TABLES"):
@@ -1950,11 +1999,11 @@ def parse_body(doc: Document, source: str, base_dir: Path):
     date_text   = strip_fmt(date_raw)
 
     add_title_page(doc, title_img_path, title_img_width, title_img_height, title_text, author_text, date_text)
-    doc.add_page_break()
+    _safe_page_break(doc)
 
     # ── Table of Contents ────────────────────────────────────────────────────
     add_toc(doc)
-    doc.add_page_break()
+    _safe_page_break(doc)
     
     # ── isolate the document body ─────────────────────────────────────────────
     begin_doc = re.search(r"\\begin\{document\}", source)
@@ -1994,12 +2043,16 @@ def parse_body(doc: Document, source: str, base_dir: Path):
     # ── resolve \\cite{...} to numbers ───────────────────────────────────────
     body = resolve_cites(body, bib_map)
 
+    # ── scan figures and tables for lists ────────────────────────────────────
+    figures = pre_scan_figures(body)
+    tables = pre_scan_tables(body)
+
     # ── walk the body ─────────────────────────────────────────────────────────
-    _walk(doc, body, base_dir)
+    _walk(doc, body, base_dir, figures, tables)
 
     # ── render bibliography ───────────────────────────────────────────────────
     if bib_inner is not None:
-        doc.add_page_break()
+        _safe_page_break(doc)
         if bib_title:
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
@@ -2035,7 +2088,7 @@ def strip_fancyhdr_cmds(text: str) -> str:
 _STRUCT = re.compile(
     r"\\(?:chapter|section|subsection|subsubsection|paragraph|begin|end|newpage|clearpage)\*?\b"
     r"|\\appendix\b"
-    r"|\\maketitle\b|\\tableofcontents\b"
+    r"|\\maketitle\b|\\tableofcontents\b|\\listoffigures\b|\\listoftables\b"
 )
 
 # Display math
@@ -2143,6 +2196,69 @@ def pre_scan_labels(text: str) -> dict:
     return labels
 
 
+def pre_scan_figures(text: str) -> list[tuple[int, str]]:
+    """Return list of (number, plain_caption) for every figure environment."""
+    figures = []
+    for env_name in ("figure", "figure*"):
+        pos = 0
+        search_str = f"\\begin{{{env_name}}}"
+        while True:
+            idx = text.find(search_str, pos)
+            if idx == -1:
+                break
+            result = extract_env(text, env_name, idx)
+            if result:
+                _, end_pos, inner = result
+                # Remove subfigure environments so we only keep the main caption
+                inner_no_sub = inner
+                sub_pos = 0
+                while True:
+                    sub_idx = inner_no_sub.find("\\begin{subfigure}", sub_pos)
+                    if sub_idx == -1:
+                        break
+                    sub_res = extract_env(inner_no_sub, "subfigure", sub_idx)
+                    if sub_res:
+                        _, sub_end, _ = sub_res
+                        inner_no_sub = inner_no_sub[:sub_idx] + inner_no_sub[sub_end:]
+                    else:
+                        sub_pos = sub_idx + 1
+                cap = _extract_caption_content(inner_no_sub)
+                if cap is not None:
+                    cap_clean = strip_fmt(cap)
+                    cap_clean = re.sub(r"\\label\{[^}]*\}", "", cap_clean).strip()
+                    if cap_clean:
+                        figures.append((len(figures) + 1, cap_clean))
+                pos = end_pos
+            else:
+                pos = idx + 1
+    return figures
+
+
+def pre_scan_tables(text: str) -> list[tuple[int, str]]:
+    """Return list of (number, plain_caption) for every table environment."""
+    tables = []
+    for env_name in ("table", "table*", "longtable"):
+        pos = 0
+        search_str = f"\\begin{{{env_name}}}"
+        while True:
+            idx = text.find(search_str, pos)
+            if idx == -1:
+                break
+            result = extract_env(text, env_name, idx)
+            if result:
+                _, end_pos, inner = result
+                cap = _extract_caption_content(inner)
+                if cap is not None:
+                    cap_clean = strip_fmt(cap)
+                    cap_clean = re.sub(r"\\label\{[^}]*\}", "", cap_clean).strip()
+                    if cap_clean:
+                        tables.append((len(tables) + 1, cap_clean))
+                pos = end_pos
+            else:
+                pos = idx + 1
+    return tables
+
+
 def resolve_refs(text: str, labels: dict) -> str:
     """Replace \\ref{...} and \\eqref{...} with the corresponding number from labels."""
     def repl(m):
@@ -2227,7 +2343,31 @@ def _render_bibliography(doc: Document, bib_inner: str, bib_map: dict):
         i += 2
 
 
-def _walk(doc: Document, text: str, base_dir: Path):
+def _insert_list_of_figures(doc: Document, figures: list[tuple[int, str]]):
+    """Insert a real Word 'List of Figures' TOC field."""
+    if not figures:
+        return
+    _insert_toc_field(
+        doc,
+        r'TOC \f F \h',
+        "ÍNDICE DE FIGURAS",
+        "No hay entradas de figuras. Haga clic derecho y seleccione Actualizar campo."
+    )
+
+
+def _insert_list_of_tables(doc: Document, tables: list[tuple[int, str]]):
+    """Insert a real Word 'List of Tables' TOC field."""
+    if not tables:
+        return
+    _insert_toc_field(
+        doc,
+        r'TOC \f T \h',
+        "ÍNDICE DE TABLAS",
+        "No hay entradas de tablas. Haga clic derecho y seleccione Actualizar campo."
+    )
+
+
+def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str]] | None = None, tables: list[tuple[int, str]] | None = None):
     """
     Scan `text` linearly.  At each structural command do the right thing,
     otherwise accumulate plain/inline text and flush as a paragraph.
@@ -2302,7 +2442,7 @@ def _walk(doc: Document, text: str, base_dir: Path):
         pb = re.match(r"\\(?:newpage|clearpage)\b", text[pos:])
         if pb:
             flush()
-            doc.add_page_break()
+            _safe_page_break(doc)
             pos += pb.end()
             continue
 
@@ -2310,6 +2450,24 @@ def _walk(doc: Document, text: str, base_dir: Path):
         skip = re.match(r"\\(?:maketitle|tableofcontents)\b", text[pos:])
         if skip:
             pos += skip.end()
+            continue
+        
+        # \listoffigures
+        lof_m = re.match(r"\\listoffigures\b", text[pos:])
+        if lof_m:
+            flush()
+            if figures:
+                _insert_list_of_figures(doc, figures)
+            pos += lof_m.end()
+            continue
+        
+        # \listoftables
+        lot_m = re.match(r"\\listoftables\b", text[pos:])
+        if lot_m:
+            flush()
+            if tables:
+                _insert_list_of_tables(doc, tables)
+            pos += lot_m.end()
             continue
         
         # \appendix — switch to appendix mode
@@ -2326,7 +2484,7 @@ def _walk(doc: Document, text: str, base_dir: Path):
         )
         if ch_m:
             flush()
-            doc.add_page_break()
+            _safe_page_break(doc)
             has_chapters = True
             sec_counters["chapter"] += 1
             sec_counters["section"] = 0
@@ -2535,9 +2693,17 @@ def _walk(doc: Document, text: str, base_dir: Path):
                     FIGURE_COUNTER[0] += 1
                     cp = doc.add_paragraph()
                     cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    fig_caption = f"Figure {FIGURE_COUNTER[0]}: " + strip_fmt(fig_cap_txt)
+                    try:
+                        cp.style = "Caption"
+                    except Exception:
+                        pass
+                    fig_clean = strip_fmt(fig_cap_txt).replace('"', "'")
+                    fig_caption = f"Figure {FIGURE_COUNTER[0]}: " + fig_clean
                     _run(cp, fig_caption,
                          italic=True, size=PT_SMALL)
+                    # Hidden TC field for List of Figures
+                    tc_text = f"Figura {FIGURE_COUNTER[0]}\t{fig_clean}"
+                    _add_tc_field(cp, tc_text, "F")
 
             elif env_name in ("equation", "equation*", "align", "align*", "gather", "gather*", "multline", "multline*", "eqnarray", "eqnarray*"):
                 full_env = f"\\begin{{{env_name}}}" + inner + f"\\end{{{env_name}}}"
