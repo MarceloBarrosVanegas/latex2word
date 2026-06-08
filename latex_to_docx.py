@@ -1373,8 +1373,9 @@ def _render_figure_as_table(doc: Document, inner: str, base_dir: Path) -> bool:
     if len(all_subfigs) <= 1:
         return False  # Usar renderizado normal para 0 o 1 subfigure
     
-    # Dividir inner en filas usando \\ como separador (aproximado)
-    row_texts = re.split(r"\\\\\s*(?=\\subfigure)", inner)
+    # Dividir inner en filas usando \\ como separador (aproximado),
+    # permitiendo argumento opcional como \\[6pt] entre filas
+    row_texts = re.split(r"\\\\(?:\s*\[[^\]]*\])?\s*(?=\\subfigure)", inner)
     
     row_groups = []
     for rt in row_texts:
