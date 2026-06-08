@@ -469,10 +469,12 @@ def latex_to_omml_element(latex_code: str, temp_dir: Path, pandoc_path: str):
     tex_file = temp_dir / f"math_{n:04d}.tex"
     out_file = temp_dir / f"math_{n:04d}.docx"
 
+    # Expand custom macros so Pandoc can parse math that relies on them
+    resolved_code = _resolve_macros(latex_code)
     tex_content = (
         r"\documentclass{article}" + "\n"
         r"\begin{document}" + "\n"
-        + latex_code + "\n"
+        + resolved_code + "\n"
         r"\end{document}" + "\n"
     )
     tex_file.write_text(tex_content, encoding="utf-8")
