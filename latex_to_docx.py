@@ -1733,7 +1733,6 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
         col_widths_dxa = _parse_col_widths_dxa("", ncols)
 
     table = doc.add_table(rows=len(rows_data), cols=ncols)
-    table.style = 'Table Grid'
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
 
     header_row_idx = 0
@@ -1759,6 +1758,7 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
             else:
                 parse_inline(p, cell_text, base_sz=PT_SMALL)
 
+    apply_booktabs_style(table)
     doc.add_paragraph()
 
 
