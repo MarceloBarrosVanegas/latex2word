@@ -1072,11 +1072,12 @@ def apply_booktabs_style(table):
             
             tcPr.append(tcBorders)
             
-            # Asegurar que el texto tenga fuente Calibri
+            # Asegurar que el texto tenga fuente Calibri y color negro
             for para in cell.paragraphs:
                 para.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
                 for run in para.runs:
                     run.font.name = FONT
+                    run.font.color.rgb = C_BLACK
                     if run.font.size is None:
                         run.font.size = Pt(PT_SMALL)
 
