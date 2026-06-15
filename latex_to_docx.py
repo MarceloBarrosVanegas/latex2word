@@ -1980,11 +1980,12 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
         # Process the item extracting nested environments in order
         remaining = item_raw
         label_used = False
+        is_continuation = False  # True for text that follows a nested environment
 
         while remaining:
             env_match = NESTED_ENV_RE.search(remaining)
             if not env_match:
-                _render_item_text(remaining, use_label=not label_used)
+                _render_item_text(remaining, use_label=not label_used, continuation=is_continuation)
                 break
 
             pre_text = remaining[:env_match.start()].strip()
@@ -1992,7 +1993,7 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
 
             result = extract_env(remaining, env_name, env_match.start())
             if not result:
-                _render_item_text(remaining, use_label=not label_used)
+                _render_item_text(remaining, use_label=not label_used, continuation=is_continuation)
                 break
 
             _, end_pos, env_inner = result
@@ -2000,7 +2001,7 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
             post_text = remaining[end_pos:].strip()
 
             # Render text before the environment
-            _render_item_text(pre_text, use_label=not label_used)
+            _render_item_text(pre_text, use_label=not label_used, continuation=is_continuation)
             label_used = True
 
             # Render the environment itself
@@ -2010,11 +2011,9 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
             else:
                 _walk(doc, env_text, base_dir)
 
-            # Text after the nested environment is a continuation of the current item
-            if post_text:
-                _render_item_text(post_text, use_label=False, continuation=True)
-                label_used = True
-            remaining = ""
+            # Continue scanning the remainder of the item for more nested environments
+            remaining = post_text
+            is_continuation = True
 
         # If item was empty but had a label, make sure at least the label is rendered
         if not remaining and not label_used and custom_label:
