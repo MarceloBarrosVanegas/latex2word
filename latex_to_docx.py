@@ -1854,6 +1854,45 @@ def _get_list_number_abstract_num_id(doc: Document):
         return None
 
 
+def _split_items(inner: str) -> list[str]:
+    r"""Split list inner content by \item only at the current nesting level.
+
+    This avoids treating \item commands inside nested itemize/enumerate
+    environments as top-level item separators.
+    """
+    items = []
+    current = []
+    depth = 0
+    i = 0
+    n = len(inner)
+    while i < n:
+        m_begin = re.match(r"\\begin\{(itemize|enumerate)\*?\}", inner[i:])
+        if m_begin:
+            depth += 1
+            current.append(m_begin.group(0))
+            i += m_begin.end()
+            continue
+        m_end = re.match(r"\\end\{(itemize|enumerate)\*?\}", inner[i:])
+        if m_end:
+            depth = max(0, depth - 1)
+            current.append(m_end.group(0))
+            i += m_end.end()
+            continue
+        if depth == 0 and inner.startswith(r"\item", i):
+            items.append("".join(current))
+            current = []
+            i += len(r"\item")
+            continue
+        current.append(inner[i])
+        i += 1
+    if current:
+        items.append("".join(current))
+    # Drop leading empty chunk before the first \item
+    if items and not items[0].strip():
+        items = items[1:]
+    return items
+
+
 def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0, base_dir: Path = Path(".")):
     r"""
     Recursively parse itemize / enumerate and add list paragraphs.
@@ -1865,8 +1904,8 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
     if depth > 0:
         bullet_style = "List Bullet 2" if not ordered else "List Number 2"
 
-    # Split on \item boundaries
-    items_raw = re.split(r"\\item\b", inner)
+    # Split on \item boundaries, respecting nested itemize/enumerate
+    items_raw = _split_items(inner)
     
     item_index = 0  # Counter for auto-numbering when no custom label
 
@@ -1899,10 +1938,10 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
             para_style = bullet_style
 
         # Helper to render a paragraph of item text
-        def _render_item_text(text: str, use_label: bool):
+        def _render_item_text(text: str, use_label: bool, continuation: bool = False):
             if not text and not use_label:
                 return
-            if ordered and not has_custom_label and not use_label:
+            if ordered and not has_custom_label and not use_label and not continuation:
                 # Manual numbering ensures each enumerate restarts at 1
                 p = doc.add_paragraph(style="Normal")
                 p.paragraph_format.left_indent = Inches(0.5 * (depth + 1))
@@ -1914,9 +1953,14 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
                 parse_inline(p, text)
                 _maybe_add_tab_stop(p, text)
             else:
-                p = doc.add_paragraph(style=para_style)
-                if has_custom_label:
-                    p.paragraph_format.left_indent = Inches(0.3 * (depth + 1))
+                if continuation:
+                    # Continuation paragraph: normal style, same indentation as list items, no number
+                    p = doc.add_paragraph(style="Normal")
+                    p.paragraph_format.left_indent = Inches(0.5 * (depth + 1))
+                else:
+                    p = doc.add_paragraph(style=para_style)
+                    if has_custom_label:
+                        p.paragraph_format.left_indent = Inches(0.3 * (depth + 1))
                 if use_label and custom_label:
                     n_runs_before = len(p.runs)
                     parse_inline(p, custom_label)
@@ -1960,7 +2004,11 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
             else:
                 _walk(doc, env_text, base_dir)
 
-            remaining = post_text
+            # Text after the nested environment is a continuation of the current item
+            if post_text:
+                _render_item_text(post_text, use_label=False, continuation=True)
+                label_used = True
+            remaining = ""
 
         # If item was empty but had a label, make sure at least the label is rendered
         if not remaining and not label_used and custom_label:
