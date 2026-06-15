@@ -475,6 +475,9 @@ def latex_to_omml_element(latex_code: str, temp_dir: Path, pandoc_path: str):
     # splitting the number (e.g. $25{,}8^{\circ}$ becomes 25 , 8°).
     # Replace it with a dot for Pandoc and restore commas in the OMML output.
     resolved_code = resolved_code.replace("{,}", ".")
+    # Pandoc also produces empty-base superscripts for unbraced exponents
+    # like $m^3$; normalise to $m^{3}$ so the base is preserved.
+    resolved_code = re.sub(r"(?<!\{)\^([A-Za-z0-9])(?![A-Za-z0-9])", r"^{\1}", resolved_code)
     tex_content = (
         r"\documentclass{article}" + "\n"
         r"\begin{document}" + "\n"
@@ -552,14 +555,26 @@ def parse_inline(para, text: str, base_sz=PT_NORM):
     for m in _TOK.finditer(text):
         g0 = m.group(0)
         if m.group(1):   # \textbf
-            inner = re.sub(r"\\textbf\{((?:[^{}]|\{[^{}]*\})*)\}", r"\1", g0)
-            _run(para, _clean(strip_fmt(inner)), bold=True, size=base_sz)
+            inner_m = re.search(r"\\textbf\{((?:[^{}]|\{[^{}]*\})*)\}", g0)
+            if inner_m:
+                n_runs = len(para.runs)
+                parse_inline(para, inner_m.group(1), base_sz=base_sz)
+                for run in para.runs[n_runs:]:
+                    run.bold = True
         elif m.group(2): # \textit
-            inner = re.sub(r"\\textit\{((?:[^{}]|\{[^{}]*\})*)\}", r"\1", g0)
-            _run(para, _clean(strip_fmt(inner)), italic=True, size=base_sz)
+            inner_m = re.search(r"\\textit\{((?:[^{}]|\{[^{}]*\})*)\}", g0)
+            if inner_m:
+                n_runs = len(para.runs)
+                parse_inline(para, inner_m.group(1), base_sz=base_sz)
+                for run in para.runs[n_runs:]:
+                    run.italic = True
         elif m.group(3): # \emph
-            inner = re.sub(r"\\emph\{((?:[^{}]|\{[^{}]*\})*)\}", r"\1", g0)
-            _run(para, _clean(strip_fmt(inner)), italic=True, size=base_sz)
+            inner_m = re.search(r"\\emph\{((?:[^{}]|\{[^{}]*\})*)\}", g0)
+            if inner_m:
+                n_runs = len(para.runs)
+                parse_inline(para, inner_m.group(1), base_sz=base_sz)
+                for run in para.runs[n_runs:]:
+                    run.italic = True
         elif m.group(4): # \href{url}{text}
             link_txt = re.sub(r"\\href\{[^}]*\}\{((?:[^{}]|\{[^{}]*\})*)\}", r"\1", g0)
             _run(para, _clean(strip_fmt(link_txt)), color=C_LINK, underline=True, size=base_sz)
