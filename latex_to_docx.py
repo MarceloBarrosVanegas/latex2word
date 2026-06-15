@@ -1365,8 +1365,9 @@ def _render_figure_as_table(doc: Document, inner: str, base_dir: Path) -> bool:
     """
     # Patrón: \subfigure[caption]{\includegraphics[opts]{name}}
     subfig_pattern = (
-        r"\\subfigure\s*\[((?:[^\[\]]|\\\[|\\\])*)\]\s*\{"
-        r"\s*\\includegraphics(?:\[([^\]]*)\])?\{([^}]*)\}\s*\}"
+        r"\\subfigure\s*\[((?:[^\[\]]|\\\[|\\)*)\]\s*\{+\s*"
+        r"\s*\\includegraphics(?:\[([^\]]*)\])?\{([^}]*)\}"
+        r"(?:\s*\\label\{[^}]*\})?\s*\}+"
     )
     all_subfigs = list(re.finditer(subfig_pattern, inner))
     
@@ -1816,10 +1817,11 @@ def _get_list_number_abstract_num_id(doc: Document):
         return None
 
 
-def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0):
+def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0, base_dir: Path = Path(".")):
     r"""
     Recursively parse itemize / enumerate and add list paragraphs.
-    Handles nested lists and custom \item[label] labels.
+    Handles nested lists, custom \item[label] labels,
+    and block environments (figure, table, center, etc.) inside items.
     """
     bullet_style  = "List Bullet"  if not ordered else "List Number"
     # Try to use indented styles for nesting
@@ -1830,6 +1832,9 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
     items_raw = re.split(r"\\item\b", inner)
     
     item_index = 0  # Counter for auto-numbering when no custom label
+
+    # Environments that can appear inside an \item and need special handling
+    NESTED_ENV_RE = re.compile(r"\\begin\{(itemize|enumerate|figure|table\*?|longtable|center|tikzpicture)\b")
 
     for item_raw in items_raw:
         item_raw = item_raw.strip()
@@ -1850,57 +1855,17 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
             item_index += 1  # Only increment for auto-numbered items
 
         # When custom label exists, use normal paragraph (not list style) to avoid double numbering
-        # This also makes text use 'Normal' style (justified, full width)
+        # This also makes text use 'Normal' style (justified, more width)
         if has_custom_label:
             para_style = "Normal"  # Use Normal style for custom labels (justified, more width)
         else:
             para_style = bullet_style
 
-        # Check for nested list inside this item
-        nested_match = re.search(r"\\begin\{(itemize|enumerate)\b", item_raw)
-        if nested_match:
-            pre_text  = item_raw[:nested_match.start()].strip()
-            post_text = ""
-            # find the matching \end
-            env_name = nested_match.group(1)
-            result   = extract_env(item_raw, env_name, nested_match.start())
-            if result:
-                _, end_pos, nested_inner = result
-                post_text = item_raw[end_pos:].strip()
-            else:
-                nested_inner = ""
-                post_text    = ""
-
-            # Render the item's own text
-            if pre_text or custom_label:
-                p = doc.add_paragraph(style=para_style)
-                # Add left indent for custom labels to align with list items
-                if has_custom_label:
-                    p.paragraph_format.left_indent = Inches(0.3 * (depth + 1))
-                if custom_label:
-                    n_runs_before = len(p.runs)
-                    parse_inline(p, custom_label)
-                    for run in p.runs[n_runs_before:]:
-                        run.bold = True
-                        run.font.name = FONT
-                    _run(p, "  ", size=PT_NORM)
-                parse_inline(p, pre_text)
-                _maybe_add_tab_stop(p, pre_text)
-
-            # Render nested list
-            if nested_inner:
-                is_ordered = ("enumerate" in nested_match.group(1))
-                render_list(doc, nested_inner, is_ordered, depth + 1)
-
-            # Render any text after the nested list
-            if post_text:
-                p = doc.add_paragraph(style=para_style)
-                if has_custom_label:
-                    p.paragraph_format.left_indent = Inches(0.3 * (depth + 1))
-                parse_inline(p, post_text)
-                _maybe_add_tab_stop(p, post_text)
-        else:
-            if ordered and not has_custom_label:
+        # Helper to render a paragraph of item text
+        def _render_item_text(text: str, use_label: bool):
+            if not text and not use_label:
+                return
+            if ordered and not has_custom_label and not use_label:
                 # Manual numbering ensures each enumerate restarts at 1
                 p = doc.add_paragraph(style="Normal")
                 p.paragraph_format.left_indent = Inches(0.5 * (depth + 1))
@@ -1909,41 +1874,60 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
                 run.font.name = FONT
                 run.font.size = Pt(PT_NORM)
                 run.font.color.rgb = C_BLACK
-                parse_inline(p, item_raw)
-                _maybe_add_tab_stop(p, item_raw)
+                parse_inline(p, text)
+                _maybe_add_tab_stop(p, text)
             else:
                 p = doc.add_paragraph(style=para_style)
                 if has_custom_label:
                     p.paragraph_format.left_indent = Inches(0.3 * (depth + 1))
-                if custom_label:
+                if use_label and custom_label:
                     n_runs_before = len(p.runs)
                     parse_inline(p, custom_label)
                     for run in p.runs[n_runs_before:]:
                         run.bold = True
                         run.font.name = FONT
                     _run(p, "  ", size=PT_NORM)
-                parse_inline(p, item_raw)
-                _maybe_add_tab_stop(p, item_raw)
+                parse_inline(p, text)
+                _maybe_add_tab_stop(p, text)
 
+        # Process the item extracting nested environments in order
+        remaining = item_raw
+        label_used = False
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main document body parser
-# ─────────────────────────────────────────────────────────────────────────────
+        while remaining:
+            env_match = NESTED_ENV_RE.search(remaining)
+            if not env_match:
+                _render_item_text(remaining, use_label=not label_used)
+                break
 
-# Commands that produce no visible output
-_SKIP_CMD = re.compile(
-    r"\\(?:label|ref|pageref|addcontentsline|setlength|setlist|"
-    r"hspace|vspace|noindent|centering|par\b|medskip|bigskip|smallskip|"
-    r"rowcolors|arrayrulecolor|cellcolor|rowcolor|footnotesize|normalsize|"
-    r"small|large|Large|huge|Huge|setcounter|newcounter|"
-    r"usetikzlibrary|tcbuselibrary|pagestyle|fancyhf|lhead|rhead|cfoot|"
-    r"hypersetup|maketitle|tableofcontents|newpage|clearpage|"
-    r"setlength|headheight|PrestadorI|PrestadorII|PrestadorIII|"
-    r"DiaI|DiaII|DiaIII|DiaIV|DiaFinal|Entidad|Unidad|NombreDoc|"
-    r"Plazo|MontoRef)\*?"
-)
+            pre_text = remaining[:env_match.start()].strip()
+            env_name = env_match.group(1)
 
+            result = extract_env(remaining, env_name, env_match.start())
+            if not result:
+                _render_item_text(remaining, use_label=not label_used)
+                break
 
+            _, end_pos, env_inner = result
+            env_text = remaining[env_match.start():end_pos]
+            post_text = remaining[end_pos:].strip()
+
+            # Render text before the environment
+            _render_item_text(pre_text, use_label=not label_used)
+            label_used = True
+
+            # Render the environment itself
+            if env_name in ("itemize", "enumerate"):
+                inner_clean = re.sub(r"^\s*\[[^\]]*\]\s*", "", env_inner)
+                render_list(doc, inner_clean, ordered=(env_name == "enumerate"), depth=depth + 1, base_dir=base_dir)
+            else:
+                _walk(doc, env_text, base_dir)
+
+            remaining = post_text
+
+        # If item was empty but had a label, make sure at least the label is rendered
+        if not remaining and not label_used and custom_label:
+            _render_item_text("", use_label=True)
 def parse_body(doc: Document, source: str, base_dir: Path):
     """Walk the entire source and render into `doc`."""
     global PREAMBLE_GLOBAL
@@ -2647,7 +2631,7 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
             if env_name in ("itemize", "enumerate", "description"):
                 # Strip optional arguments like [label=..., leftmargin=...]
                 inner = re.sub(r"^\s*\[[^\]]*\]\s*", "", inner)
-                render_list(doc, inner, ordered=(env_name == "enumerate"))
+                render_list(doc, inner, ordered=(env_name == "enumerate"), base_dir=base_dir)
 
             elif env_name in ("table", "table*"):
                 cap_txt = _extract_caption_content(inner)
