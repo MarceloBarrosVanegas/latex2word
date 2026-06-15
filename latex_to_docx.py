@@ -2093,23 +2093,21 @@ def pre_scan_labels(text: str) -> dict:
     fig_counter = 0
     table_counter = 0
 
-    # Figures
+    # Figures (including figure*)
+    fig_pattern = re.compile(r"\\begin\{figure\*?\}")
     pos = 0
     while True:
-        idx = text.find("\\begin{figure}", pos)
-        if idx == -1:
+        m = fig_pattern.search(text, pos)
+        if not m:
             break
+        idx = m.start()
         result = extract_env(text, "figure", idx)
         if result:
             _, end_pos, inner = result
             if "\\caption{" in inner:
                 fig_counter += 1
-                label_idx = inner.find("\\label{")
-                if label_idx >= 0:
-                    start = label_idx + len("\\label{")
-                    end = inner.find("}", start)
-                    if end >= 0:
-                        labels[inner[start:end]] = str(fig_counter)
+                for label_m in re.finditer(r"\\label\{([^}]*)\}", inner):
+                    labels[label_m.group(1)] = str(fig_counter)
             pos = end_pos
         else:
             pos = idx + 1
@@ -2127,12 +2125,8 @@ def pre_scan_labels(text: str) -> dict:
                 _, end_pos, inner = result
                 if "\\caption{" in inner:
                     table_counter += 1
-                    label_idx = inner.find("\\label{")
-                    if label_idx >= 0:
-                        start = label_idx + len("\\label{")
-                        end = inner.find("}", start)
-                        if end >= 0:
-                            labels[inner[start:end]] = str(table_counter)
+                    for label_m in re.finditer(r"\\label\{([^}]*)\}", inner):
+                        labels[label_m.group(1)] = str(table_counter)
                 pos = end_pos
             else:
                 pos = idx + 1
@@ -2167,10 +2161,14 @@ def pre_scan_labels(text: str) -> dict:
             result = extract_env(text, env_name, next_idx)
             if result:
                 _, end_pos, inner = result
-                label_m = re.search(r"\\label\{([^}]*)\}", inner)
-                if label_m:
-                    eq_counter += 1
-                    labels[label_m.group(1)] = str(eq_counter)
+                # align/gather/etc. may contain multiple equations (one per \\ line);
+                # number each labeled line sequentially.
+                lines = re.split(r"\\\\(?:\[[^\]]*\])?", inner)
+                for line in lines:
+                    label_m = re.search(r"\\label\{([^}]*)\}", line)
+                    if label_m:
+                        eq_counter += 1
+                        labels[label_m.group(1)] = str(eq_counter)
                 pos = end_pos
             else:
                 pos = next_idx + 1
