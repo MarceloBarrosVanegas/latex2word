@@ -471,6 +471,10 @@ def latex_to_omml_element(latex_code: str, temp_dir: Path, pandoc_path: str):
 
     # Expand custom macros so Pandoc can parse math that relies on them
     resolved_code = _resolve_macros(latex_code)
+    # Pandoc mis-parses the European decimal brace syntax {,} in math mode,
+    # splitting the number (e.g. $25{,}8^{\circ}$ becomes 25 , 8°).
+    # Replace it with a dot for Pandoc and restore commas in the OMML output.
+    resolved_code = resolved_code.replace("{,}", ".")
     tex_content = (
         r"\documentclass{article}" + "\n"
         r"\begin{document}" + "\n"
@@ -497,6 +501,14 @@ def latex_to_omml_element(latex_code: str, temp_dir: Path, pandoc_path: str):
                 tag = child.tag
                 if tag == f"{{{MATH_NS}}}oMath" or tag == f"{{{MATH_NS}}}oMathPara":
                     result = deepcopy(child)
+                    # Restore European decimal commas and use the standard
+                    # degree sign (U+00B0) instead of the ring operator.
+                    for t_el in result.iter(f"{{{MATH_NS}}}t"):
+                        if t_el.text:
+                            txt = t_el.text
+                            txt = txt.replace("\u2218", "\u00b0")
+                            txt = re.sub(r"(\d)\.(\d)", r"\1,\2", txt)
+                            t_el.text = txt
                     OMML_CACHE[cache_key] = result
                     return result
     except Exception:
@@ -526,7 +538,17 @@ _TOK = re.compile(
 def parse_inline(para, text: str, base_sz=PT_NORM):
     """Parse inline LaTeX and add styled runs to `para`."""
     text = _resolve_macros(text)
+    # Protect inline math ($...$) from _clean, which otherwise corrupts
+    # commands like \circ, \cdot, etc. before Pandoc can process them.
+    math_segments = []
+    def _protect_math(m):
+        math_segments.append(m.group(0))
+        return f"\x00MATH{len(math_segments) - 1}\x00"
+    text = re.sub(r"\$[^$]+\$", _protect_math, text)
     text = _clean(text)
+    def _restore_math(m):
+        return math_segments[int(m.group(1))]
+    text = re.sub(r"\x00MATH(\d+)\x00", _restore_math, text)
     for m in _TOK.finditer(text):
         g0 = m.group(0)
         if m.group(1):   # \textbf
