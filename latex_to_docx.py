@@ -582,17 +582,23 @@ def parse_inline(para, text: str, base_sz=PT_NORM):
             url = re.sub(r"\\url\{([^}]*)\}", r"\1", g0)
             _run(para, url, color=C_LINK, underline=True, size=base_sz)
         elif m.group(6): # $math$
-            omml = None
-            if TEMP_DIR and PANDOC_PATH:
-                try:
-                    omml = latex_to_omml_element(g0, TEMP_DIR, PANDOC_PATH)
-                except Exception:
-                    pass
-            if omml is not None:
-                para._p.append(omml)
+            math_content = g0[1:-1]   # strip $
+            # Plain numeric values (e.g. $-0,92$) are better as normal text
+            # so they match the surrounding table/text formatting.
+            if re.fullmatch(r"\s*[-+]?\d+(?:[.,]\d+)?\s*", math_content):
+                plain_num = math_content.strip().replace(".", ",")
+                _run(para, plain_num, size=base_sz)
             else:
-                math_content = g0[1:-1]   # strip $
-                _run(para, _clean(strip_fmt(math_content)), italic=True, size=base_sz)
+                omml = None
+                if TEMP_DIR and PANDOC_PATH:
+                    try:
+                        omml = latex_to_omml_element(g0, TEMP_DIR, PANDOC_PATH)
+                    except Exception:
+                        pass
+                if omml is not None:
+                    para._p.append(omml)
+                else:
+                    _run(para, _clean(strip_fmt(math_content)), italic=True, size=base_sz)
         elif m.group(7): # \label, \ref, \pageref — skip
             pass
         elif m.group(8): # generic \cmd
