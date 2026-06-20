@@ -12,7 +12,7 @@ cls
 :: CONFIGURA AQUI LA RUTA COMPLETA DE TU ARCHIVO .tex
 :: Ejemplo: SET TEX_PATH=C:\Users\Usuario\Documentos\mi_archivo.tex
 :: ------------------------------------------------------------
-SET TEX_PATH=C:\Users\Alienware\OneDrive\PROYECTOS\07_elecaustro_tuni\02_Ejecucion\FASE_1\00_geotenica\informe.tex
+SET TEX_PATH=C:\Users\chelo\OneDrive\00_OFC\12_documentos_ofc\02_ISP\03_mou\mou_nrw_isabela_english.tex
 :: ------------------------------------------------------------
 
 :: Extraer solo el nombre del archivo (sin ruta ni extension)

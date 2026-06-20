@@ -2,15 +2,44 @@
 CONVERSOR LaTeX A WORD - Galapagos Water Project
 ═══════════════════════════════════════════════════════════════
 
+REQUISITOS PREVIOS:
+───────────────────
+1. Python instalado y agregado al PATH de Windows.
+   Descargar desde: https://www.python.org/downloads/
+
+2. Pandoc instalado y disponible en el PATH.
+   El script de configuracion intentara instalarlo automaticamente.
+   Si no lo logra, descargalo desde: https://pandoc.org/installing.html
+
+═══════════════════════════════════════════════════════════════
+
+PRIMERA VEZ - CONFIGURAR EL ENTORNO:
+────────────────────────────────────
+1. Haz doble clic en "00_setup_entorno.bat"
+   Esto crea un entorno virtual e instala las bibliotecas necesarias:
+      - python-docx
+      - lxml
+      - Pillow
+
+2. Si Pandoc no esta instalado, el script intentara instalarlo.
+   Si se abre la pagina de descarga, instala Pandoc y vuelve a
+   ejecutar "00_setup_entorno.bat".
+
+═══════════════════════════════════════════════════════════════
+
 COMO USAR:
 ──────────
-1. Edita "convertir.bat":
-      SET TEX_FILE=linea_base_en
+1. Edita "00_CONVERTIR.bat":
+      SET TEX_PATH=ruta\completa\de\tu\archivo.tex
 
-2. Guarda y haz doble clic en "convertir.bat"
+2. Guarda los cambios.
 
-3. El archivo Word se guarda en esta misma carpeta
-   (latex_to_word_converter)
+3. Haz doble clic en "00_convertir_con_entorno.bat"
+   (usa este archivo, NO el anterior, para que todo corra dentro
+   del entorno virtual configurado).
+
+4. El archivo Word se guarda en esta misma carpeta:
+      latex_to_word_converter\
 
 ═══════════════════════════════════════════════════════════════
 
@@ -31,7 +60,7 @@ Metodo manual:
 
 1. Ve a la pagina "LIST OF TABLES"
 2. Haz clic debajo del titulo
-3. Menu: REFERENCES → Insert Table of Authorities
+3. Menu: REFERENCES -> Insert Table of Authorities
 4. Haz clic en OK
 
 ═══════════════════════════════════════════════════════════════
@@ -40,5 +69,14 @@ ARCHIVOS GENERADOS:
 ───────────────────
 - linea_base_en.docx (o el nombre que configuraste)
 - Se guarda en: latex_to_word_converter\
+
+═══════════════════════════════════════════════════════════════
+
+ARCHIVOS IMPORTANTES:
+─────────────────────
+- 00_setup_entorno.bat          : Configura el entorno virtual (primera vez)
+- 00_convertir_con_entorno.bat  : Convierte usando el entorno virtual
+- 00_CONVERTIR.bat              : Script de conversion original
+- requirements.txt              : Lista de bibliotecas Python necesarias
 
 ═══════════════════════════════════════════════════════════════

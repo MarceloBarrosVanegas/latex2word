@@ -1272,12 +1272,13 @@ def _parse_graphics_size(opts_str: str, img_path: Path):
     r"""
     Parse \\includegraphics[...] options and return (width_inches, height_inches).
     Supports: width=0.65\\textwidth, width=\\textwidth, width=5cm, height=0.28\\textheight,
-              height=\\textheight, height=3cm, scale=0.5.
+              height=\\textheight, height=3cm, scale=0.5, keepaspectratio.
     Reads natural image size for aspect ratio if needed.
     """
     width = None
     height = None
     scale = None
+    keep_aspect = "keepaspectratio" in opts_str.lower().replace("-", "").replace(" ", "")
 
     # width = fraction \textwidth (fraction optional, defaults to 1.0)
     m = re.search(r"width=([\d.]*)\\?textwidth", opts_str)
@@ -1345,6 +1346,17 @@ def _parse_graphics_size(opts_str: str, img_path: Path):
     elif height is not None and width is None:
         ratio = height / nat_h
         width = nat_w * ratio
+    elif width is not None and height is not None:
+        # Both width and height were specified
+        if keep_aspect:
+            # Fit inside the width x height box while preserving aspect ratio
+            scale_w = width / nat_w
+            scale_h = height / nat_h
+            scale = min(scale_w, scale_h)
+            width = nat_w * scale
+            height = nat_h * scale
+        # Without keepaspectratio LaTeX distorts the image, so we keep
+        # the explicit width and height as-is.
 
     return width, height
 
