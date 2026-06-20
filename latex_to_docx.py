@@ -2170,8 +2170,10 @@ def parse_body(doc: Document, source: str, base_dir: Path):
     author_text = strip_fmt(author_raw)
     date_text   = strip_fmt(date_raw)
 
-    add_title_page(doc, title_img_path, title_img_width, title_img_height, title_text, author_text, date_text)
-    _safe_page_break(doc)
+    has_title_content = bool(title_text or author_text or date_text or (title_img_path and title_img_path.exists()))
+    if has_title_content:
+        add_title_page(doc, title_img_path, title_img_width, title_img_height, title_text, author_text, date_text)
+        _safe_page_break(doc)
 
     # ── Table of Contents ────────────────────────────────────────────────────
     add_toc(doc)
