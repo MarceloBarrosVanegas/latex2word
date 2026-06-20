@@ -2087,7 +2087,9 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
                     n_runs_before = len(p.runs)
                     parse_inline(p, custom_label)
                     for run in p.runs[n_runs_before:]:
-                        run.bold = True
+                        # enumitem default labels should match LaTeX formatting (not bold)
+                        if not is_enumitem_label:
+                            run.bold = True
                         run.font.name = FONT
                     _run(p, "  ", size=PT_NORM)
                 parse_inline(p, text)
