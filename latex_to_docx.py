@@ -1055,6 +1055,10 @@ PREAMBLE_GLOBAL: str = ""
 # Rutas de búsqueda de imágenes extraídas de \graphicspath{{...}}
 GRAPHICSPATHS: list[Path] = []
 
+# Opciones por defecto de enumitem extraídas del preámbulo (se establece en parse_body)
+# Formato: {nivel: label_format, None: label_format_global}
+ENUMITEM_DEFAULTS: dict[int | None, str] = {}
+
 def apply_booktabs_style(table):
     """
     Aplica estilo LaTeX booktabs a una tabla:
@@ -1198,6 +1202,29 @@ def _parse_enumitem_label(optional_arg: str) -> str:
     if m:
         return m.group(1).strip()
     return None
+
+
+def _extract_enumitem_defaults(preamble: str) -> dict[int | None, str]:
+    r"""Extrae los labels por defecto de \setlist[enumerate]{...} del pre�mbulo."""
+    defaults: dict[int | None, str] = {}
+    # Busca \setlist[enumerate,...]{...} o \setlist[enumerate]{...}
+    for m in re.finditer(r'\\setlist\s*\[\s*enumerate\s*(?:,\s*(\d+))?\s*\]\s*\{', preamble):
+        level = int(m.group(1)) if m.group(1) else None
+        content = _extract_balanced_braces(preamble, m.end() - 1)
+        if content is None:
+            continue
+        label = _parse_enumitem_label(content)
+        if label:
+            defaults[level] = label
+    return defaults
+
+
+def _get_enumitem_default(level: int) -> str | None:
+    """Devuelve el label por defecto para el nivel dado, o el global si no hay específico."""
+    if level in ENUMITEM_DEFAULTS:
+        return ENUMITEM_DEFAULTS[level]
+    return ENUMITEM_DEFAULTS.get(None)
+
 
 def is_duplicate_row(row_texts: list, seen_rows: list) -> bool:
     """
@@ -2097,6 +2124,9 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
             if env_name in ("itemize", "enumerate"):
                 opt_arg, env_inner_clean = _extract_optional_arg(env_inner)
                 nested_label = _parse_enumitem_label(opt_arg) if opt_arg else None
+                # Apply enumitem default label for nested enumerate if no explicit option
+                if env_name == "enumerate" and nested_label is None:
+                    nested_label = _get_enumitem_default(depth + 2)
                 render_list(doc, env_inner_clean, ordered=(env_name == "enumerate"), depth=depth + 1, base_dir=base_dir, label_format=nested_label)
             else:
                 _walk(doc, env_text, base_dir)
@@ -2124,6 +2154,10 @@ def parse_body(doc: Document, source: str, base_dir: Path):
     # Extraer rutas de imágenes del preámbulo
     global GRAPHICSPATHS
     GRAPHICSPATHS = _extract_graphicspaths(PREAMBLE_GLOBAL)
+
+    # Extraer opciones por defecto de enumitem del preámbulo
+    global ENUMITEM_DEFAULTS
+    ENUMITEM_DEFAULTS = _extract_enumitem_defaults(PREAMBLE_GLOBAL)
 
     # ── remove comments ──────────────────────────────────────────────────────
     # Elimina comentarios (% hasta fin de línea) pero preserva \% (porcentaje literal)
@@ -2812,6 +2846,9 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 # Extract optional arguments like [label=..., leftmargin=...]
                 opt_arg, inner = _extract_optional_arg(inner)
                 label_format = _parse_enumitem_label(opt_arg) if opt_arg else None
+                # Apply enumitem default label for enumerate if no explicit option
+                if env_name == "enumerate" and label_format is None:
+                    label_format = _get_enumitem_default(1)
                 render_list(doc, inner, ordered=(env_name == "enumerate"), base_dir=base_dir, label_format=label_format)
 
             elif env_name in ("table", "table*"):
