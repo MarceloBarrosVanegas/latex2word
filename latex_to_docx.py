@@ -1131,6 +1131,74 @@ def normalize_text(text: str) -> str:
     return ' '.join(text.strip().lower().split())
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# enumitem label helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _int_to_roman(num: int, upper: bool = True) -> str:
+    val = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
+    syms = ['M', 'CM', 'D', 'CD', 'C', 'XC', 'L', 'XL', 'X', 'IX', 'V', 'IV', 'I']
+    res = ''
+    for v, s in zip(val, syms):
+        while num >= v:
+            res += s
+            num -= v
+    return res if upper else res.lower()
+
+
+def _int_to_alpha(num: int, upper: bool = True) -> str:
+    res = ''
+    while num > 0:
+        num -= 1
+        res = chr(ord('A') + (num % 26)) + res
+        num //= 26
+    return res if upper else res.lower()
+
+
+def _format_enumitem_label(label_format: str, index: int) -> str:
+    if not label_format:
+        return str(index)
+    fmt = label_format
+    fmt = re.sub(r'\\roman\*', lambda m: _int_to_roman(index, upper=False), fmt)
+    fmt = re.sub(r'\\Roman\*', lambda m: _int_to_roman(index, upper=True), fmt)
+    fmt = re.sub(r'\\alph\*',  lambda m: _int_to_alpha(index, upper=False), fmt)
+    fmt = re.sub(r'\\Alph\*',  lambda m: _int_to_alpha(index, upper=True), fmt)
+    fmt = re.sub(r'\\arabic\*', lambda m: str(index), fmt)
+    return fmt
+
+
+def _extract_optional_arg(text: str):
+    text = text.lstrip()
+    if not text.startswith('['):
+        return None, text
+    depth = 0
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == '[':
+            depth += 1
+        elif c == ']':
+            depth -= 1
+            if depth == 0:
+                arg = text[1:i]
+                rest = text[i + 1:].lstrip()
+                return arg, rest
+        elif c == "\\" and i + 1 < len(text):
+            i += 1
+        i += 1
+    return None, text
+
+
+def _parse_enumitem_label(optional_arg: str) -> str:
+    if not optional_arg:
+        return None
+    m = re.search(r'(?:^|[,\[]\s*)label\s*=\s*(.+?)(?:\s*,\s*\w+\s*=|$)', optional_arg, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return None
+
 def is_duplicate_row(row_texts: list, seen_rows: list) -> bool:
     """
     Detecta si una fila es idéntica a una ya vista.
@@ -1911,7 +1979,7 @@ def _split_items(inner: str) -> list[str]:
     return items
 
 
-def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0, base_dir: Path = Path(".")):
+def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0, base_dir: Path = Path("."), label_format: str = None):
     r"""
     Recursively parse itemize / enumerate and add list paragraphs.
     Handles nested lists, custom \item[label] labels,
@@ -1941,12 +2009,17 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
         label_m = re.match(r"^\[([^\]]*)\]\s*", item_raw)
         custom_label = None
         has_custom_label = False
+        is_enumitem_label = False
         if label_m:
             custom_label = _clean(label_m.group(1))
             item_raw     = item_raw[label_m.end():]
             has_custom_label = True
         else:
             item_index += 1  # Only increment for auto-numbered items
+            if ordered and label_format:
+                custom_label = _format_enumitem_label(label_format, item_index)
+                has_custom_label = True
+                is_enumitem_label = True
 
         # When custom label exists, use normal paragraph (not list style) to avoid double numbering
         # This also makes text use 'Normal' style (justified, more width)
@@ -1978,7 +2051,11 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
                 else:
                     p = doc.add_paragraph(style=para_style)
                     if has_custom_label:
-                        p.paragraph_format.left_indent = Inches(0.3 * (depth + 1))
+                        if is_enumitem_label:
+                            p.paragraph_format.left_indent = Inches(0.5 * (depth + 1))
+                            p.paragraph_format.first_line_indent = Inches(-0.35)
+                        else:
+                            p.paragraph_format.left_indent = Inches(0.3 * (depth + 1))
                 if use_label and custom_label:
                     n_runs_before = len(p.runs)
                     parse_inline(p, custom_label)
@@ -2018,8 +2095,9 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
 
             # Render the environment itself
             if env_name in ("itemize", "enumerate"):
-                inner_clean = re.sub(r"^\s*\[[^\]]*\]\s*", "", env_inner)
-                render_list(doc, inner_clean, ordered=(env_name == "enumerate"), depth=depth + 1, base_dir=base_dir)
+                opt_arg, env_inner_clean = _extract_optional_arg(env_inner)
+                nested_label = _parse_enumitem_label(opt_arg) if opt_arg else None
+                render_list(doc, env_inner_clean, ordered=(env_name == "enumerate"), depth=depth + 1, base_dir=base_dir, label_format=nested_label)
             else:
                 _walk(doc, env_text, base_dir)
 
@@ -2729,9 +2807,10 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
             _, end_pos, inner = result
 
             if env_name in ("itemize", "enumerate", "description"):
-                # Strip optional arguments like [label=..., leftmargin=...]
-                inner = re.sub(r"^\s*\[[^\]]*\]\s*", "", inner)
-                render_list(doc, inner, ordered=(env_name == "enumerate"), base_dir=base_dir)
+                # Extract optional arguments like [label=..., leftmargin=...]
+                opt_arg, inner = _extract_optional_arg(inner)
+                label_format = _parse_enumitem_label(opt_arg) if opt_arg else None
+                render_list(doc, inner, ordered=(env_name == "enumerate"), base_dir=base_dir, label_format=label_format)
 
             elif env_name in ("table", "table*"):
                 cap_txt = _extract_caption_content(inner)
