@@ -2786,30 +2786,33 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
 
         # Section headings
         sec_m = re.match(
-            r"\\(section|subsection|subsubsection|paragraph)\*?\s*\{((?:[^{}]|\{[^{}]*\})*)\}",
+            r"\\(section|subsection|subsubsection|paragraph)(\*)?\s*\{((?:[^{}]|\{[^{}]*\})*)\}",
             text[pos:]
         )
         if sec_m:
             flush()
-            cmd   = sec_m.group(1)
-            htxt  = strip_fmt(sec_m.group(2))
-            
-            # Update counters
-            if cmd == "section":
-                sec_counters["section"] += 1
-                sec_counters["subsection"] = 0
-                sec_counters["subsubsection"] = 0
-                sec_counters["paragraph"] = 0
-            elif cmd == "subsection":
-                sec_counters["subsection"] += 1
-                sec_counters["subsubsection"] = 0
-                sec_counters["paragraph"] = 0
-            elif cmd == "subsubsection":
-                sec_counters["subsubsection"] += 1
-                sec_counters["paragraph"] = 0
-            elif cmd == "paragraph":
-                sec_counters["paragraph"] += 1
-            
+            cmd      = sec_m.group(1)
+            starred  = sec_m.group(2) is not None
+            htxt     = strip_fmt(sec_m.group(3))
+
+            # Starred versions (\section*) are not numbered and do not update counters
+            if not starred:
+                # Update counters
+                if cmd == "section":
+                    sec_counters["section"] += 1
+                    sec_counters["subsection"] = 0
+                    sec_counters["subsubsection"] = 0
+                    sec_counters["paragraph"] = 0
+                elif cmd == "subsection":
+                    sec_counters["subsection"] += 1
+                    sec_counters["subsubsection"] = 0
+                    sec_counters["paragraph"] = 0
+                elif cmd == "subsubsection":
+                    sec_counters["subsubsection"] += 1
+                    sec_counters["paragraph"] = 0
+                elif cmd == "paragraph":
+                    sec_counters["paragraph"] += 1
+
             # Get level and formatted number
             if has_chapters:
                 level = {"section": 2, "subsection": 3,
@@ -2819,10 +2822,10 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 level = {"section": 1, "subsection": 2,
                          "subsubsection": 3, "paragraph": 4}[cmd]
                 sizes = [16, 14, 12, 11]
-            num_str = format_section_number(cmd)
-            
+            num_str = "" if starred else format_section_number(cmd)
+
             # Create heading with number - use explicit style for TOC recognition
-            full_title = f"{num_str}  {htxt}"
+            full_title = f"{num_str}  {htxt}".strip()
             style_name = f"Heading {level}"
             p = doc.add_paragraph(style=style_name)
             run = p.add_run(full_title)
