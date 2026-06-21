@@ -3373,7 +3373,13 @@ def main():
     global TEMP_DIR, PANDOC_PATH
     
     in_path  = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("linea_base_en.tex")
-    out_path = Path(sys.argv[2]) if len(sys.argv) > 2 else in_path.with_suffix(".docx")
+    if len(sys.argv) > 2:
+        out_path = Path(sys.argv[2])
+    else:
+        out_path = in_path.with_suffix(".docx")
+    # If output path is relative, save next to the input .tex
+    if not out_path.is_absolute():
+        out_path = in_path.parent / out_path
 
     if not in_path.exists():
         print(f"Error: file not found: {in_path}", file=sys.stderr)
