@@ -361,13 +361,11 @@ def _clean(text: str) -> str:
     Does NOT strip formatting commands — use strip_fmt() for plain text.
     """
     text = _resolve_macros(text)
-    # Remove common layout commands before accent processing to avoid \c in \centering being treated as cedilla
+    # Note: font-size switches (\large, \normalsize, etc.) and font switches
+    # (\bfseries, \normalfont) are now handled by parse_inline so they can
+    # affect formatting. They are no longer stripped here.
+    # Remove \centering to avoid \c being treated as cedilla during accent processing.
     text = re.sub(r"\\centering\b", " ", text)
-    text = re.sub(r"\\large\b", " ", text)
-    text = re.sub(r"\\Large\b", " ", text)
-    text = re.sub(r"\\small\b", " ", text)
-    text = re.sub(r"\\normalsize\b", " ", text)
-    text = re.sub(r"\\footnotesize\b", " ", text)
     # Convert LaTeX accent commands to Unicode (\'{a}, \'a, \~{n}, \^u, etc.)
     # MUST happen before replacing standalone ~ with non-breaking space
     def _accent_repl(m):
@@ -533,13 +531,18 @@ _TOK = re.compile(
     r"|(\\url\{[^}]*\})"                               # \url{...}
     r"|(\$[^$]+\$)"                                    # $inline math$
     r"|(\\(?:label|ref|pageref|eqref)\{[^}]*\})"      # \label{...}, \ref{...} — skip
+    r"|(\\(?:bfseries|normalfont|itshape|large|Large|LARGE|small|normalsize|footnotesize|scriptsize|tiny|huge|Huge)\b)"  # font switches
     r"|(\\[a-zA-Z]+\*?(?:\{[^}]*\})*)"                # generic \cmd{arg}...
     r"|([^\\${}]+)"                                    # plain text
 )
 
 
-def parse_inline(para, text: str, base_sz=PT_NORM):
-    """Parse inline LaTeX and add styled runs to `para`."""
+def parse_inline(para, text: str, base_sz=PT_NORM, bold=False, italic=False, size=None):
+    r"""Parse inline LaTeX and add styled runs to `para`.
+
+    Supports formatting switches such as \bfseries, \normalfont, \itshape,
+    \large, \normalsize, etc. by tracking current bold/italic/size state.
+    """
     text = _resolve_macros(text)
     # Protect inline math ($...$) from _clean, which otherwise corrupts
     # commands like \circ, \cdot, etc. before Pandoc can process them.
@@ -552,42 +555,66 @@ def parse_inline(para, text: str, base_sz=PT_NORM):
     def _restore_math(m):
         return math_segments[int(m.group(1))]
     text = re.sub(r"\x00MATH(\d+)\x00", _restore_math, text)
+
+    cur_bold = bool(bold)
+    cur_italic = bool(italic)
+    cur_size = size if size is not None else base_sz
+
+    # LaTeX size switches mapped to approximate Word point sizes
+    size_map = {
+        "tiny": 6,
+        "scriptsize": 8,
+        "footnotesize": 9,
+        "small": 10,
+        "normalsize": PT_NORM,
+        "large": 14,
+        "Large": 16,
+        "LARGE": 20,
+        "huge": 24,
+        "Huge": 28,
+    }
+
     for m in _TOK.finditer(text):
         g0 = m.group(0)
         if m.group(1):   # \textbf
             inner_m = re.search(r"\\textbf\{((?:[^{}]|\{[^{}]*\})*)\}", g0)
             if inner_m:
                 n_runs = len(para.runs)
-                parse_inline(para, inner_m.group(1), base_sz=base_sz)
+                parse_inline(para, inner_m.group(1), base_sz=base_sz,
+                             bold=cur_bold, italic=cur_italic, size=cur_size)
                 for run in para.runs[n_runs:]:
                     run.bold = True
         elif m.group(2): # \textit
             inner_m = re.search(r"\\textit\{((?:[^{}]|\{[^{}]*\})*)\}", g0)
             if inner_m:
                 n_runs = len(para.runs)
-                parse_inline(para, inner_m.group(1), base_sz=base_sz)
+                parse_inline(para, inner_m.group(1), base_sz=base_sz,
+                             bold=cur_bold, italic=cur_italic, size=cur_size)
                 for run in para.runs[n_runs:]:
                     run.italic = True
         elif m.group(3): # \emph
             inner_m = re.search(r"\\emph\{((?:[^{}]|\{[^{}]*\})*)\}", g0)
             if inner_m:
                 n_runs = len(para.runs)
-                parse_inline(para, inner_m.group(1), base_sz=base_sz)
+                parse_inline(para, inner_m.group(1), base_sz=base_sz,
+                             bold=cur_bold, italic=cur_italic, size=cur_size)
                 for run in para.runs[n_runs:]:
                     run.italic = True
         elif m.group(4): # \href{url}{text}
             link_txt = re.sub(r"\\href\{[^}]*\}\{((?:[^{}]|\{[^{}]*\})*)\}", r"\1", g0)
-            _run(para, _clean(strip_fmt(link_txt)), color=C_LINK, underline=True, size=base_sz)
+            _run(para, _clean(strip_fmt(link_txt)), color=C_LINK, underline=True,
+                 size=cur_size, bold=cur_bold, italic=cur_italic)
         elif m.group(5): # \url{...}
             url = re.sub(r"\\url\{([^}]*)\}", r"\1", g0)
-            _run(para, url, color=C_LINK, underline=True, size=base_sz)
+            _run(para, url, color=C_LINK, underline=True,
+                 size=cur_size, bold=cur_bold, italic=cur_italic)
         elif m.group(6): # $math$
             math_content = g0[1:-1]   # strip $
             # Plain numeric values (e.g. $-0,92$) are better as normal text
             # so they match the surrounding table/text formatting.
             if re.fullmatch(r"\s*[-+]?\d+(?:[.,]\d+)?\s*", math_content):
                 plain_num = math_content.strip().replace(".", ",")
-                _run(para, plain_num, size=base_sz)
+                _run(para, plain_num, size=cur_size, bold=cur_bold, italic=cur_italic)
             else:
                 omml = None
                 if TEMP_DIR and PANDOC_PATH:
@@ -598,17 +625,30 @@ def parse_inline(para, text: str, base_sz=PT_NORM):
                 if omml is not None:
                     para._p.append(omml)
                 else:
-                    _run(para, _clean(strip_fmt(math_content)), italic=True, size=base_sz)
+                    _run(para, _clean(strip_fmt(math_content)),
+                         italic=True, size=cur_size, bold=cur_bold)
         elif m.group(7): # \label, \ref, \pageref — skip
             pass
-        elif m.group(8): # generic \cmd
+        elif m.group(8): # font switches: \bfseries, \normalfont, \itshape, \large, etc.
+            cmd = g0.lstrip("\\").strip()
+            if cmd == "bfseries":
+                cur_bold = True
+            elif cmd == "normalfont":
+                cur_bold = False
+                cur_italic = False
+            elif cmd == "itshape":
+                cur_italic = True
+            elif cmd in size_map:
+                cur_size = size_map[cmd]
+            # Other unrecognized switches become no-ops
+        elif m.group(9): # generic \cmd
             plain = strip_fmt(g0)
             if plain:
-                _run(para, _clean(plain), size=base_sz)
+                _run(para, _clean(plain), size=cur_size, bold=cur_bold, italic=cur_italic)
         else:            # plain text
             cleaned = _clean(g0)
             if cleaned:
-                _run(para, cleaned, size=base_sz)
+                _run(para, cleaned, size=cur_size, bold=cur_bold, italic=cur_italic)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2651,17 +2691,23 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
     otherwise accumulate plain/inline text and flush as a paragraph.
     """
     pending: list[str] = []
-    
+
     # Section / chapter counters
     sec_counters = {"chapter": 0, "section": 0, "subsection": 0, "subsubsection": 0, "paragraph": 0}
     appendix_mode = False
     has_chapters = False
 
+    # Current font state propagated across paragraph breaks
+    fmt_bold = False
+    fmt_italic = False
+    fmt_size = PT_NORM
+
     def flush():
-        nonlocal pending
+        nonlocal pending, fmt_bold, fmt_italic, fmt_size
         raw = " ".join(pending).strip()
         if raw:
-            _add_para(doc, raw)
+            _add_para(doc, raw, init_bold=fmt_bold, init_italic=fmt_italic, init_size=fmt_size)
+            fmt_bold, fmt_italic, fmt_size = _scan_format_switches(raw, fmt_bold, fmt_italic, fmt_size)
         pending = []
     
     def format_section_number(cmd: str) -> str:
@@ -3089,7 +3135,7 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 r"|usepackage|documentclass|title|author|date"
                 r"|usetikzlibrary|tcbuselibrary|hypersetup|rowcolors"
                 r"|arrayrulecolor|cellcolor|newcounter|setcounter"
-                r"|newcommand|renewcommand|setlist|footnotesize|normalsize)\b",
+                r"|newcommand|renewcommand|setlist)\b",
                 line
             ):
                 continue
@@ -3108,16 +3154,88 @@ def _maybe_add_tab_stop(para, text: str):
         para.paragraph_format.tab_stops.add_tab_stop(Inches(1.5))
 
 
-def _add_para(doc: Document, raw: str):
-    """Create a justified paragraph from raw inline LaTeX."""
+def _parse_leading_switches(text: str, bold: bool, italic: bool, size: int):
+    r"""Extract initial font switches (\bfseries, \large, etc.) and update state."""
+    size_map = {
+        "tiny": 6, "scriptsize": 8, "footnotesize": 9, "small": 10,
+        "normalsize": PT_NORM, "large": 14, "Large": 16, "LARGE": 20,
+        "huge": 24, "Huge": 28,
+    }
+    pattern = re.compile(
+        r"^\s*\\(bfseries|normalfont|itshape|"
+        r"tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)\b\s*"
+    )
+    while True:
+        m = pattern.match(text)
+        if not m:
+            break
+        cmd = m.group(1)
+        if cmd == "bfseries":
+            bold = True
+        elif cmd == "normalfont":
+            bold = False
+            italic = False
+        elif cmd == "itshape":
+            italic = True
+        elif cmd in size_map:
+            size = size_map[cmd]
+        text = text[m.end():]
+    return bold, italic, size, text
+
+
+def _scan_format_switches(text: str, bold: bool, italic: bool, size: int):
+    r"""Scan text for font switches and return the final formatting state."""
+    size_map = {
+        "tiny": 6, "scriptsize": 8, "footnotesize": 9, "small": 10,
+        "normalsize": PT_NORM, "large": 14, "Large": 16, "LARGE": 20,
+        "huge": 24, "Huge": 28,
+    }
+    pattern = re.compile(
+        r"\\(bfseries|normalfont|itshape|"
+        r"tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)\b"
+    )
+    for m in pattern.finditer(text):
+        cmd = m.group(1)
+        if cmd == "bfseries":
+            bold = True
+        elif cmd == "normalfont":
+            bold = False
+            italic = False
+        elif cmd == "itshape":
+            italic = True
+        elif cmd in size_map:
+            size = size_map[cmd]
+    return bold, italic, size
+
+
+def _add_para(doc: Document, raw: str, init_bold=False, init_italic=False, init_size=None):
+    r"""Create justified paragraph(s) from raw inline LaTeX.
+
+    Handles paragraph breaks (\\ or blank lines) and propagates font switches
+    such as \bfseries / \large across the generated paragraphs.
+    """
     raw = raw.strip()
     if not raw:
         return None
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-    parse_inline(p, raw)
-    _maybe_add_tab_stop(p, raw)
-    return p
+    paragraphs = re.split(r"\n\s*\n", raw)
+    cur_bold = bool(init_bold)
+    cur_italic = bool(init_italic)
+    cur_size = init_size if init_size is not None else PT_NORM
+    last_p = None
+    for para_text in paragraphs:
+        para_text = para_text.strip()
+        if not para_text:
+            continue
+        cur_bold, cur_italic, cur_size, para_text = _parse_leading_switches(
+            para_text, cur_bold, cur_italic, cur_size
+        )
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        parse_inline(p, para_text, base_sz=PT_NORM,
+                     bold=cur_bold, italic=cur_italic, size=cur_size)
+        _maybe_add_tab_stop(p, para_text)
+        last_p = p
+    return last_p
 
 
 # ─────────────────────────────────────────────────────────────────────────────
