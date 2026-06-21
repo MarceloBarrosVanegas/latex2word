@@ -1846,21 +1846,41 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
         return False
 
 
+def _is_p_only_table(col_spec: str) -> bool:
+    """Return True if the table has a single p/m/b column (no l/c/r/X).
+
+    In single-column p{} tables, \\ inside the cell is a line break rather
+    than a row separator, so Pandoc's row splitting produces too many rows.
+    """
+    if not col_spec:
+        return False
+    spec_clean = re.sub(r">\s*\{[^}]*\}", "", col_spec)
+    spec_clean = re.sub(r"@[^{]*", "", spec_clean)
+    spec_clean = re.sub(r"\|+", "", spec_clean)
+    p_cols = re.findall(r"[pmb]\{[^}]*\}", spec_clean)
+    other_cols = re.findall(r"[lcrX]", spec_clean)
+    return len(p_cols) == 1 and not other_cols
+
+
 def render_table(doc: Document, tab_inner: str, caption: str = "",
-                 ncols_hint: int = 0, col_widths_dxa: list = None):
+                 ncols_hint: int = 0, col_widths_dxa: list = None,
+                 col_spec: str = ""):
     """
     Convert LaTeX tabular inner content to a Word table.
     First tries Pandoc, falls back to manual rendering.
     Tables with inline math ($...$) skip Pandoc because Pandoc places
     OMML on separate paragraphs; fallback manual rendering keeps math inline.
+    Vertical p-only tables are also rendered manually because Pandoc treats
+    in-cell \\ as row separators.
     """
+    p_only = _is_p_only_table(col_spec)
     has_inline_math = bool(re.search(r"\$[^$]+\$", tab_inner))
-    if not has_inline_math and render_table_with_pandoc(doc, tab_inner, caption):
+    if not p_only and not has_inline_math and render_table_with_pandoc(doc, tab_inner, caption):
         return
-    if has_inline_math:
+    if p_only or has_inline_math:
         # Consume the Pandoc counter so subsequent tables stay in sync
         TABLE_COUNTER[0] += 1
-    
+
     # Fallback: manual rendering
     if caption:
         add_table_caption(doc, caption, TABLE_COUNTER[0])
@@ -1869,8 +1889,16 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
     cleaned_inner = re.sub(r"p\{[^}]*\}", "", tab_inner)
     cleaned_inner = re.sub(r"m\{[^}]*\}", "", cleaned_inner)
     cleaned_inner = re.sub(r"b\{[^}]*\}", "", cleaned_inner)
-    
-    raw_rows = re.split(r"\\\\", cleaned_inner)
+
+    # Detect "vertical" tables where every column is p/m/b (no l/c/r/X).
+    # In such tables \\ inside a cell is a line break, not a row separator.
+    p_only = _is_p_only_table(col_spec)
+
+    if p_only:
+        # Split rows by horizontal rules; keep \\ as in-cell line breaks
+        raw_rows = re.split(r"\\(?:toprule|midrule|bottomrule|hline)\b", cleaned_inner)
+    else:
+        raw_rows = re.split(r"\\\\", cleaned_inner)
 
     rows_data = []
     is_header_row = []
@@ -1944,18 +1972,28 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
             cell_text = re.sub(r"\\label\{[^}]*\}", "", cell_text)
             cell_text = re.sub(r"\\hspace\*?\{[^}]*\}", "", cell_text)
 
-            p = cell.paragraphs[0]
-            p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER if (ri == header_row_idx) else WD_ALIGN_PARAGRAPH.LEFT
-
-            if ri == header_row_idx:
-                if '$' in cell_text:
-                    parse_inline(p, cell_text, base_sz=PT_SMALL)
-                    for run in p.runs:
-                        run.bold = True
-                else:
-                    _run(p, strip_fmt(cell_text), bold=True, size=PT_SMALL)
+            # For vertical p-only tables, treat \\ inside a cell as line breaks
+            if p_only:
+                cell_lines = [ln.strip() for ln in re.split(r"\\\\(?:\[[^\]]*\])?", cell_text) if ln.strip()]
             else:
-                parse_inline(p, cell_text, base_sz=PT_SMALL)
+                cell_lines = [cell_text]
+
+            for line_idx, line in enumerate(cell_lines):
+                if line_idx == 0:
+                    p = cell.paragraphs[0]
+                else:
+                    p = cell.add_paragraph()
+                p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER if (ri == header_row_idx) else WD_ALIGN_PARAGRAPH.LEFT
+
+                if ri == header_row_idx:
+                    if '$' in line:
+                        parse_inline(p, line, base_sz=PT_SMALL)
+                        for run in p.runs:
+                            run.bold = True
+                    else:
+                        _run(p, strip_fmt(line), bold=True, size=PT_SMALL)
+                else:
+                    parse_inline(p, line, base_sz=PT_SMALL)
 
     apply_booktabs_style(table)
     doc.add_paragraph()
@@ -2911,31 +2949,31 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                     if tr:
                         _, _, tab_inner = tr
                         # remove column spec: first {...}
-                        _, tab_inner = _strip_column_spec(tab_inner)
+                        col_spec, tab_inner = _strip_column_spec(tab_inner)
                         # remove \resizebox wrapper
                         tab_inner = re.sub(r"\\resizebox\{[^}]*\}\{[^}]*\}\{?\s*", "", tab_inner)
                         tab_inner = re.sub(r"\s*\}?\s*$", "", tab_inner)
-                        render_table(doc, tab_inner, caption)
+                        render_table(doc, tab_inner, caption, col_spec=col_spec)
                         break
 
             elif env_name == "longtable":
                 cap_txt = _extract_caption_content(inner)
                 caption = cap_txt if cap_txt is not None else ""
                 # strip column spec
-                _, inner = _strip_column_spec(inner)
+                col_spec, inner = _strip_column_spec(inner)
                 # strip \endfirsthead...\endhead  and  \endfoot...\endlastfoot
                 inner = re.sub(r"\\endfirsthead.*?\\endhead",     "", inner, flags=re.DOTALL)
                 inner = re.sub(r"\\endfoot.*?\\endlastfoot",       "", inner, flags=re.DOTALL)
                 inner = _remove_captions(inner)
-                render_table(doc, inner, caption)
+                render_table(doc, inner, caption, col_spec=col_spec)
 
             elif env_name in ("tabular", "tabularx"):
                 # tabular/tabularx directo (sin \begin{table} wrapper)
-                _, inner = _strip_column_spec(inner)
+                col_spec, inner = _strip_column_spec(inner)
                 # remove \resizebox wrapper
                 inner = re.sub(r"\\resizebox\{[^}]*\}\{[^}]*\}\{?\s*", "", inner)
                 inner = re.sub(r"\s*\}?\s*$", "", inner)
-                render_table(doc, inner, caption="")
+                render_table(doc, inner, caption="", col_spec=col_spec)
 
             elif env_name == "center":
                 n_para_before = len(doc.paragraphs)
