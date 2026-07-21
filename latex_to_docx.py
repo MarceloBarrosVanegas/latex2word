@@ -914,8 +914,8 @@ def _extract_balanced_braces(text: str, start: int):
 
 
 def _extract_caption_content(text: str) -> str | None:
-    """Extract the first \\caption{...} content, handling nested braces."""
-    idx = text.find("\\caption{")
+    """Extract the last \\caption{...} content, handling nested braces."""
+    idx = text.rfind("\\caption{")
     if idx == -1:
         return None
     brace_start = idx + len("\\caption{") - 1  # position of '{'
@@ -1239,9 +1239,16 @@ def _parse_enumitem_label(optional_arg: str) -> str:
     if not optional_arg:
         return None
     m = re.search(r'(?:^|[,\[]\s*)label\s*=\s*(.+?)(?:\s*,\s*\w+\s*=|$)', optional_arg, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    return None
+    if not m:
+        return None
+    label = m.group(1).strip()
+    # Strip trailing value-less enumitem options (e.g. nosep, noitemsep, wide)
+    # that the regex may have captured because they have no '='.
+    label = re.sub(
+        r'\s*,\s*(nosep|noitemsep|wide|leftmargin|labelsep|itemsep|topsep|parsep|partopsep|align|font|format|before|after|ref)\s*$',
+        '', label, flags=re.IGNORECASE
+    )
+    return label
 
 
 def _extract_enumitem_defaults(preamble: str) -> dict[int | None, str]:
@@ -1547,43 +1554,23 @@ def _insert_image_with_size(para, img_path: Path, max_width_inches: float = 6.3,
 
 def _render_figure_as_table(doc: Document, inner: str, base_dir: Path) -> bool:
     r"""
-    Renderiza una figura con múltiples \subfigure en una tabla de Word,
-    respetando filas detectadas por \\ (salto de línea LaTeX) o \hfill.
-    Todas las imágenes de una misma fila comparten la misma altura,
-    y la fila completa se escala proporcionalmente si excede el ancho de página.
-    Devuelve True si se renderizó como tabla, False si no había subfigures.
+    Renderiza una figura con múltiples subfigures en una tabla de Word.
+
+    Soporta dos formatos:
+      1) Entornos subfigure modernos:
+         \begin{subfigure}[b]{0.32\textwidth}
+             \centering
+             \includegraphics[width=\textwidth]{...}
+             \caption{...}\label{...}
+         \end{subfigure}
+      2) Comando \subfigure antiguo:
+         \subfigure[caption]{\includegraphics[opts]{name}}
+
+    Las filas se detectan por los saltos de línea LaTeX (\\) entre subfigures.
+    Las imágenes se escalan para ocupar uniformemente el ancho de texto.
+    Devuelve True si se renderizó como tabla, False en caso contrario.
     """
-    # Patrón: \subfigure[caption]{\includegraphics[opts]{name}}
-    subfig_pattern = (
-        r"\\subfigure\s*\[((?:[^\[\]]|\\\[|\\)*)\]\s*\{+\s*"
-        r"\s*\\includegraphics(?:\[([^\]]*)\])?\{([^}]*)\}"
-        r"(?:\s*\\label\{[^}]*\})?\s*\}+"
-    )
-    all_subfigs = list(re.finditer(subfig_pattern, inner))
-    
-    if len(all_subfigs) <= 1:
-        return False  # Usar renderizado normal para 0 o 1 subfigure
-    
-    # Dividir inner en filas usando \\ como separador (aproximado),
-    # permitiendo argumento opcional como \\[6pt] entre filas
-    row_texts = re.split(r"\\\\(?:\s*\[[^\]]*\])?\s*(?=\\subfigure)", inner)
-    
-    row_groups = []
-    for rt in row_texts:
-        sf_in_row = list(re.finditer(subfig_pattern, rt))
-        if sf_in_row:
-            row_groups.append(sf_in_row)
-    
-    if not row_groups:
-        return False
-    
-    max_cols = max(len(g) for g in row_groups)
-    if max_cols == 0:
-        return False
-    
-    # ── Primera pasada: calcular tamaños deseados de cada imagen ─────────────
-    DEFAULT_HEIGHT = 2.5  # pulgadas, si ninguna imagen especifica tamaño
-    
+
     def _get_natural_size(img_path):
         try:
             from PIL import Image
@@ -1592,110 +1579,130 @@ def _render_figure_as_table(doc: Document, inner: str, base_dir: Path) -> bool:
             return px_w / 96.0, px_h / 96.0
         except Exception:
             return 4.0, 3.0
-    
-    row_data = []  # lista de filas; cada fila es lista de dicts
-    for subfigs in row_groups:
-        row = []
-        for sf in subfigs:
-            opts = sf.group(2) or ""
-            img_name = sf.group(3)
-            img_path = resolve_image_path(img_name, base_dir)
-            nat_w, nat_h = _get_natural_size(img_path)
-            
-            w, h = _parse_graphics_size(opts, img_path)
-            
-            # Si no se especificó nada, usar altura default
-            if w is None and h is None:
-                h = DEFAULT_HEIGHT
-                w = nat_w * (h / nat_h)
-            elif w is not None and h is None:
-                h = nat_h * (w / nat_w)
-            elif h is not None and w is None:
-                w = nat_w * (h / nat_h)
-            
-            row.append({
-                "sf": sf,
-                "img_path": img_path,
-                "img_name": img_name,
+
+    items = []  # dicts: img_name, img_path, opts, caption, start, end
+
+    # ── Formato moderno: \begin{subfigure} ... \end{subfigure} ────────────────
+    env_matches = list(re.finditer(r"\\begin\{subfigure\}", inner))
+    if env_matches:
+        for m in env_matches:
+            result = extract_env(inner, "subfigure", m.start())
+            if not result:
+                continue
+            _, end_pos, sf_inner = result
+            img_m = re.search(r"\\includegraphics(?:\[([^\]]*)\])?\{([^}]*)\}", sf_inner)
+            if not img_m:
+                continue
+            caption = _extract_caption_content(sf_inner) or ""
+            items.append({
+                "img_name": img_m.group(2),
+                "img_path": resolve_image_path(img_m.group(2), base_dir),
+                "opts": img_m.group(1) or "",
+                "caption": caption,
+                "start": m.start(),
+                "end": end_pos,
+            })
+
+    # ── Formato antiguo: \subfigure[caption]{\includegraphics...} ────────────
+    if not items:
+        subfig_pattern = (
+            r"\\subfigure\s*\[((?:[^\[\]]|\\\[|\\)*)\]\s*\{+\s*"
+            r"\s*\\includegraphics(?:\[([^\]]*)\])?\{([^}]*)\}"
+            r"(?:\s*\\label\{[^}]*\})?\s*\}+"
+        )
+        for sf in re.finditer(subfig_pattern, inner):
+            items.append({
+                "img_name": sf.group(3),
+                "img_path": resolve_image_path(sf.group(3), base_dir),
+                "opts": sf.group(2) or "",
+                "caption": sf.group(1),
+                "start": sf.start(),
+                "end": sf.end(),
+            })
+
+    if len(items) <= 1:
+        return False
+
+    # ── Agrupar en filas usando \\ como separador entre subfigures ───────────
+    row_groups = []
+    current_row = [items[0]]
+    for i in range(1, len(items)):
+        segment = inner[items[i - 1]["end"]:items[i]["start"]]
+        if re.search(r"\\\\(?:\s*\[[^\]]*\])?", segment):
+            row_groups.append(current_row)
+            current_row = [items[i]]
+        else:
+            current_row.append(items[i])
+    row_groups.append(current_row)
+
+    max_cols = max(len(g) for g in row_groups)
+    if max_cols == 0:
+        return False
+
+    # ── Calcular tamaños finales para cada fila ──────────────────────────────
+    final_rows = []
+    for row in row_groups:
+        n_cols = len(row)
+        cell_width = TEXT_WIDTH_INCHES / max_cols
+        scaled_row = []
+        for item in row:
+            nat_w, nat_h = _get_natural_size(item["img_path"])
+            # Escalar para que el ancho ocupe la celda disponible
+            scale = cell_width / nat_w if nat_w > 0 else 1.0
+            final_w = cell_width
+            final_h = nat_h * scale
+            scaled_row.append({
+                **item,
                 "nat_w": nat_w,
                 "nat_h": nat_h,
-                "desired_w": w,
-                "desired_h": h,
+                "final_w": final_w,
+                "final_h": final_h,
             })
-        row_data.append(row)
-    
-    # ── Segunda pasada: calcular altura común y escalar filas si es necesario ─
-    final_rows = []
-    for row in row_data:
-        # Altura común = mínimo de alturas deseadas (respeta la más restrictiva)
-        common_h = min(item["desired_h"] for item in row)
-        
-        # Recalcular anchos a la altura común
-        scaled_row = []
-        total_w = 0.0
-        for item in row:
-            new_w = item["nat_w"] * (common_h / item["nat_h"])
-            scaled_row.append({**item, "final_w": new_w, "final_h": common_h})
-            total_w += new_w
-        
-        # Si la fila completa excede el ancho de texto, escalar proporcionalmente
-        if total_w > TEXT_WIDTH_INCHES:
-            scale = TEXT_WIDTH_INCHES / total_w
-            for item in scaled_row:
-                item["final_w"] *= scale
-                item["final_h"] *= scale
-        
         final_rows.append(scaled_row)
-    
-    # ── Tercera pasada: crear la tabla e insertar imágenes con tamaños finales ─
+
+    # ── Crear la tabla e insertar imágenes ───────────────────────────────────
     table = doc.add_table(rows=len(row_groups), cols=max_cols)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     table.autofit = False
     table.allow_autofit = False
-    
+
     subfig_idx = 0
-    
     for ri, row in enumerate(final_rows):
         n_cols = len(row)
         for ci, item in enumerate(row):
             cell = table.cell(ri, ci)
             cell.text = ""
             cell.width = Inches(item["final_w"])
-            
-            caption_text = strip_fmt(item["sf"].group(1))
-            img_path = item["img_path"]
-            img_name = item["img_name"]
-            
-            # Párrafo para la imagen
+
             p_img = cell.paragraphs[0]
             p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            if img_path and img_path.exists():
+            if item["img_path"] and item["img_path"].exists():
                 try:
                     p_img.add_run().add_picture(
-                        str(img_path),
+                        str(item["img_path"]),
                         width=Inches(item["final_w"]),
                         height=Inches(item["final_h"]),
                     )
                 except Exception:
-                    _run(p_img, f"[Figure: {img_name}]", italic=True, size=PT_SMALL)
+                    _run(p_img, f"[Figure: {item['img_name']}]", italic=True, size=PT_SMALL)
             else:
-                _run(p_img, f"[Figure: {img_name}]", italic=True, size=PT_SMALL)
-            
-            # Caption del subfigure
+                _run(p_img, f"[Figure: {item['img_name']}]", italic=True, size=PT_SMALL)
+
+            caption_text = strip_fmt(item["caption"])
             if caption_text:
                 p_cap = cell.add_paragraph()
                 p_cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 letter = chr(ord('a') + subfig_idx)
                 _run(p_cap, f"({letter}) {caption_text}", italic=True, size=PT_SMALL)
-            
+
             subfig_idx += 1
-        
+
         # Celdas vacías sobrantes
         for ci in range(n_cols, max_cols):
             cell = table.cell(ri, ci)
             cell.text = ""
-    
-    # Quitar bordes a toda la tabla
+
+    # ── Quitar bordes ────────────────────────────────────────────────────────
     for row in table.rows:
         for cell in row.cells:
             tc = cell._tc
@@ -1706,7 +1713,7 @@ def _render_figure_as_table(doc: Document, inner: str, base_dir: Path) -> bool:
                 b.set(qn('w:val'), 'nil')
                 tcBorders.append(b)
             tcPr.append(tcBorders)
-    
+
     return True
 
 
@@ -1862,9 +1869,18 @@ def _is_p_only_table(col_spec: str) -> bool:
     return len(p_cols) == 1 and not other_cols
 
 
+def _has_complex_col_spec(col_spec: str) -> bool:
+    r"""Detect column spec constructs that Pandoc handles poorly, such as
+    >{\centering\arraybackslash}p{...}.
+    """
+    if not col_spec:
+        return False
+    return bool(re.search(r">\s*\{[^}]*\}", col_spec))
+
+
 def render_table(doc: Document, tab_inner: str, caption: str = "",
                  ncols_hint: int = 0, col_widths_dxa: list = None,
-                 col_spec: str = ""):
+                 col_spec: str = "", is_array: bool = False):
     """
     Convert LaTeX tabular inner content to a Word table.
     First tries Pandoc, falls back to manual rendering.
@@ -1875,14 +1891,22 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
     """
     p_only = _is_p_only_table(col_spec)
     has_inline_math = bool(re.search(r"\$[^$]+\$", tab_inner))
-    if not p_only and not has_inline_math and render_table_with_pandoc(doc, tab_inner, caption):
+    complex_spec = _has_complex_col_spec(col_spec)
+
+    # Tablas \begin{array} dentro de math display no tienen archivo Pandoc
+    # temporal; se renderizan siempre con fallback manual.
+    if is_array:
+        TABLE_COUNTER[0] += 1
+        if caption:
+            add_table_caption(doc, caption, TABLE_COUNTER[0])
+    elif not p_only and not has_inline_math and not complex_spec and render_table_with_pandoc(doc, tab_inner, caption):
         return
-    if p_only or has_inline_math:
+    elif p_only or has_inline_math or complex_spec:
         # Consume the Pandoc counter so subsequent tables stay in sync
         TABLE_COUNTER[0] += 1
 
     # Fallback: manual rendering
-    if caption:
+    if caption and not is_array:
         add_table_caption(doc, caption, TABLE_COUNTER[0])
 
     # Clean tab_inner
@@ -1894,11 +1918,41 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
     # In such tables \\ inside a cell is a line break, not a row separator.
     p_only = _is_p_only_table(col_spec)
 
+    # Proteger \shortstack{...}: sus \\ internos son saltos de línea de celda,
+    # no separadores de fila. Usamos extracción balanceada para soportar
+    # \textbf{...} u otros comandos con llaves dentro del \shortstack.
+    shortstack_segments = []
+    pos = 0
+    while True:
+        idx = cleaned_inner.find("\\shortstack{", pos)
+        if idx == -1:
+            break
+        brace_start = idx + len("\\shortstack{") - 1  # posición de '{'
+        body = _extract_balanced_braces(cleaned_inner, brace_start)
+        if body is None:
+            pos = idx + len("\\shortstack{")
+            continue
+        # Los \\ internos se protegen para que no partan la fila
+        protected_body = body.replace("\\\\", "\x00SJ\x00")
+        shortstack_segments.append(protected_body)
+        replacement = f"\\shortstack{{{len(shortstack_segments)-1}}}"
+        cleaned_inner = cleaned_inner[:idx] + replacement + cleaned_inner[brace_start + len(body) + 2:]
+        pos = idx + len(replacement)
+
     if p_only:
         # Split rows by horizontal rules; keep \\ as in-cell line breaks
         raw_rows = re.split(r"\\(?:toprule|midrule|bottomrule|hline)\b", cleaned_inner)
     else:
+        # render_list may have replaced row separators with \x00NL\x00
+        cleaned_inner = cleaned_inner.replace("\x00NL\x00", "\\\\")
         raw_rows = re.split(r"\\\\", cleaned_inner)
+
+    def _restore_shortstack(m):
+        idx = int(m.group(1))
+        body = shortstack_segments[idx]
+        body = body.replace("\x00SJ\x00", "\\\\")
+        return f"\\shortstack{{{body}}}"
+    raw_rows = [re.sub(r"\\shortstack\{(\d+)\}", _restore_shortstack, r) for r in raw_rows]
 
     rows_data = []
     is_header_row = []
@@ -1975,6 +2029,16 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
             # For vertical p-only tables, treat \\ inside a cell as line breaks
             if p_only:
                 cell_lines = [ln.strip() for ln in re.split(r"\\\\(?:\[[^\]]*\])?", cell_text) if ln.strip()]
+            elif r"\shortstack" in cell_text:
+                # Expandir \shortstack{...} en líneas separadas (saltos de línea de celda).
+                # Usamos extracción balanceada para soportar \textbf{...} dentro.
+                idx = cell_text.find("\\shortstack{")
+                brace_start = idx + len("\\shortstack{") - 1
+                body = _extract_balanced_braces(cell_text, brace_start)
+                if body:
+                    cell_lines = [ln.strip() for ln in body.split("\\\\") if ln.strip()]
+                else:
+                    cell_lines = [cell_text]
             else:
                 cell_lines = [cell_text]
 
@@ -1985,6 +2049,14 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
                     p = cell.add_paragraph()
                 p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER if (ri == header_row_idx) else WD_ALIGN_PARAGRAPH.LEFT
 
+                # En tablas array (\begin{array} en modo math), envolver cada
+                # celda en $...$ para que Pandoc la convierta a OMML, salvo que
+                # ya contenga math inline.
+                if is_array and "$" not in line:
+                    line = f"${line}$"
+
+                # Sanitize any stray marker characters that leaked through
+                line = line.replace("\x00SJ\x00", "\\\\").replace("\x00NL\x00", "\\\\")
                 if ri == header_row_idx:
                     if '$' in line:
                         parse_inline(p, line, base_sz=PT_SMALL)
@@ -2101,10 +2173,22 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
     item_index = 0  # Counter for auto-numbering when no custom label
 
     # Environments that can appear inside an \item and need special handling
-    NESTED_ENV_RE = re.compile(r"\\begin\{(itemize|enumerate|figure|table\*?|longtable|center|tikzpicture)\b")
+    NESTED_ENV_RE = re.compile(
+        r"\\begin\{"
+        r"(itemize|enumerate|figure|table\*?|longtable|center|tikzpicture"
+        r"|equation\*?|align\*?|gather\*?|multline\*?|eqnarray\*?"
+        r"|small|tcolorbox|minipage|tabularx?)"
+        r"\*?\}"
+    )
+
+    # Sectioning commands that can appear inside an \item (e.g., \subsubsection)
+    SECTION_RE = re.compile(r"\\(section|subsection|subsubsection|paragraph)(\*)?\s*\{")
 
     for item_raw in items_raw:
         item_raw = item_raw.strip()
+        # Preserve explicit line breaks as paragraph separators
+        item_raw = item_raw.replace("\\\\", "\x00NL\x00")
+        item_raw = item_raw.replace("\\newline", "\x00NL\x00")
         # Normalize internal newlines/spaces from multi-line LaTeX source
         item_raw = re.sub(r"\s+", " ", item_raw)
         if not item_raw:
@@ -2137,52 +2221,108 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
         def _render_item_text(text: str, use_label: bool, continuation: bool = False):
             if not text and not use_label:
                 return
-            if ordered and not has_custom_label and not use_label and not continuation:
-                # Manual numbering ensures each enumerate restarts at 1
-                p = doc.add_paragraph(style="Normal")
-                p.paragraph_format.left_indent = Inches(0.5 * (depth + 1))
-                p.paragraph_format.first_line_indent = Inches(-0.25)
-                run = p.add_run(f"{item_index}.  ")
-                run.font.name = FONT
-                run.font.size = Pt(PT_NORM)
-                run.font.color.rgb = C_BLACK
-                parse_inline(p, text)
-                _maybe_add_tab_stop(p, text)
-            else:
-                if continuation:
-                    # Continuation paragraph: normal style, same indentation as list items, no number
+            # Split explicit line breaks into separate paragraphs
+            parts = [p.strip() for p in text.split("\x00NL\x00")]
+            parts = [p for p in parts if p]
+            if not parts and not use_label:
+                return
+
+            first = True
+            for part in (parts if parts else [""]):
+                if ordered and not has_custom_label and not use_label and not continuation and first:
+                    # Manual numbering ensures each enumerate restarts at 1
                     p = doc.add_paragraph(style="Normal")
                     p.paragraph_format.left_indent = Inches(0.5 * (depth + 1))
+                    p.paragraph_format.first_line_indent = Inches(-0.25)
+                    run = p.add_run(f"{item_index}.  ")
+                    run.font.name = FONT
+                    run.font.size = Pt(PT_NORM)
+                    run.font.color.rgb = C_BLACK
+                    parse_inline(p, part)
+                    _maybe_add_tab_stop(p, part)
                 else:
-                    p = doc.add_paragraph(style=para_style)
-                    if has_custom_label:
-                        if is_enumitem_label:
-                            p.paragraph_format.left_indent = Inches(0.5 * (depth + 1))
-                            p.paragraph_format.first_line_indent = Inches(-0.35)
-                        else:
-                            p.paragraph_format.left_indent = Inches(0.3 * (depth + 1))
-                if use_label and custom_label:
-                    n_runs_before = len(p.runs)
-                    parse_inline(p, custom_label)
-                    for run in p.runs[n_runs_before:]:
-                        # enumitem default labels should match LaTeX formatting (not bold)
-                        if not is_enumitem_label:
-                            run.bold = True
-                        run.font.name = FONT
-                    _run(p, "  ", size=PT_NORM)
-                parse_inline(p, text)
-                _maybe_add_tab_stop(p, text)
+                    if continuation or not first:
+                        # Continuation paragraph: normal style, same indentation as list items, no number
+                        p = doc.add_paragraph(style="Normal")
+                        p.paragraph_format.left_indent = Inches(0.5 * (depth + 1))
+                    else:
+                        p = doc.add_paragraph(style=para_style)
+                        if has_custom_label:
+                            if is_enumitem_label:
+                                p.paragraph_format.left_indent = Inches(0.5 * (depth + 1))
+                                p.paragraph_format.first_line_indent = Inches(-0.35)
+                            else:
+                                p.paragraph_format.left_indent = Inches(0.3 * (depth + 1))
+                    if first and use_label and custom_label:
+                        n_runs_before = len(p.runs)
+                        parse_inline(p, custom_label)
+                        for run in p.runs[n_runs_before:]:
+                            # enumitem default labels should match LaTeX formatting (not bold)
+                            if not is_enumitem_label:
+                                run.bold = True
+                            run.font.name = FONT
+                        _run(p, "  ", size=PT_NORM)
+                    parse_inline(p, part)
+                    _maybe_add_tab_stop(p, part)
+                first = False
 
-        # Process the item extracting nested environments in order
+        # Helper to render a sectioning command found inside an item
+        def _render_section_heading(cmd: str, title: str):
+            level_map = {
+                "section": 2,
+                "subsection": 3,
+                "subsubsection": 4,
+                "paragraph": 5,
+            }
+            size_map = {2: 14, 3: 13, 4: 12, 5: 11}
+            level = level_map.get(cmd, 4)
+            style_name = f"Heading {level}"
+            p = doc.add_paragraph(style=style_name)
+            run = p.add_run(strip_fmt(title))
+            run.font.name = FONT
+            run.font.size = Pt(size_map.get(level, 12))
+            run.font.bold = True
+            run.font.color.rgb = C_BLACK
+
+        # Process the item extracting nested environments and sectioning commands in order
         remaining = item_raw
         label_used = False
         is_continuation = False  # True for text that follows a nested environment
 
         while remaining:
             env_match = NESTED_ENV_RE.search(remaining)
-            if not env_match:
+            section_match = SECTION_RE.search(remaining)
+
+            # Choose the nearest structural marker
+            if env_match and section_match:
+                if env_match.start() < section_match.start():
+                    section_match = None
+                else:
+                    env_match = None
+
+            if not env_match and not section_match:
                 _render_item_text(remaining, use_label=not label_used, continuation=is_continuation)
                 break
+
+            if section_match:
+                pre_text = remaining[:section_match.start()].strip()
+                cmd = section_match.group(1)
+                brace_start = section_match.start() + section_match.end() - section_match.start() - 1
+                # section_match.end() points after '{', so brace_start is the position of '{'
+                brace_start = section_match.end() - 1
+                title = _extract_balanced_braces(remaining, brace_start)
+                if title is None:
+                    _render_item_text(remaining, use_label=not label_used, continuation=is_continuation)
+                    break
+                end_pos = brace_start + len(title) + 2
+                post_text = remaining[end_pos:].strip()
+
+                _render_item_text(pre_text, use_label=not label_used, continuation=is_continuation)
+                label_used = True
+                _render_section_heading(cmd, title)
+                remaining = post_text
+                is_continuation = True
+                continue
 
             pre_text = remaining[:env_match.start()].strip()
             env_name = env_match.group(1)
@@ -2377,6 +2517,7 @@ _STRUCT = re.compile(
     r"\\(?:chapter|section|subsection|subsubsection|paragraph|begin|end|newpage|clearpage)\*?\b"
     r"|\\appendix\b"
     r"|\\maketitle\b|\\tableofcontents\b|\\listoffigures\b|\\listoftables\b"
+    r"|\\includegraphics\b"
 )
 
 # Display math
@@ -2745,7 +2886,10 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
         raw = " ".join(pending).strip()
         if raw:
             _add_para(doc, raw, init_bold=fmt_bold, init_italic=fmt_italic, init_size=fmt_size)
-            fmt_bold, fmt_italic, fmt_size = _scan_format_switches(raw, fmt_bold, fmt_italic, fmt_size)
+            # Propagate bold/italic, but reset size between paragraphs.
+            # LaTeX size switches (\small, \footnotesize, ...) are scoped to
+            # their paragraph/group and must not leak into the rest of the document.
+            fmt_bold, fmt_italic, _ = _scan_format_switches(raw, fmt_bold, fmt_italic, PT_NORM)
         pending = []
     
     def format_section_number(cmd: str) -> str:
@@ -2943,6 +3087,7 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
             elif env_name in ("table", "table*"):
                 cap_txt = _extract_caption_content(inner)
                 caption = cap_txt if cap_txt is not None else ""
+                rendered = False
                 # Find tabular/tabularx inside
                 for tenv in ("tabularx", "tabular"):
                     tr = extract_env(inner, tenv)
@@ -2954,7 +3099,15 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                         tab_inner = re.sub(r"\\resizebox\{[^}]*\}\{[^}]*\}\{?\s*", "", tab_inner)
                         tab_inner = re.sub(r"\s*\}?\s*$", "", tab_inner)
                         render_table(doc, tab_inner, caption, col_spec=col_spec)
+                        rendered = True
                         break
+                if not rendered:
+                    # Tabla definida como \begin{array} dentro de math display
+                    arr_match = re.search(r"\$\s*\\begin\{array\}(.*?)\\end\{array\}\s*\$", inner, re.DOTALL)
+                    if arr_match:
+                        tab_inner = arr_match.group(1)
+                        col_spec, tab_inner = _strip_column_spec(tab_inner)
+                        render_table(doc, tab_inner, caption, col_spec=col_spec, is_array=True)
 
             elif env_name == "longtable":
                 cap_txt = _extract_caption_content(inner)
@@ -3106,6 +3259,14 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                     _run(p, box_title, bold=True, size=PT_NORM)
                 _walk(doc, inner, base_dir)
 
+            elif env_name == "minipage":
+                # extract_env leaves the mandatory {width} argument in inner;
+                # strip it and render the real content.
+                inner = inner.lstrip()
+                if inner.startswith("{"):
+                    _, inner = _strip_column_spec(inner)
+                _walk(doc, inner, base_dir)
+
             elif env_name in ("document",):
                 _walk(doc, inner, base_dir)
                 end_pos = len(text)   # consumed everything
@@ -3115,6 +3276,40 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 _walk(doc, inner, base_dir)
 
             pos = end_pos
+            continue
+
+        # \includegraphics outside a figure environment (e.g. in center/minipage)
+        img_m = re.match(r"\\includegraphics(?:\[([^\]]*)\])?\{([^}]*)\}", text[pos:])
+        if img_m:
+            flush()
+            opts = img_m.group(1) or ""
+            img_name = img_m.group(2)
+            img_path = resolve_image_path(img_name, base_dir)
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            if img_path and img_path.exists():
+                try:
+                    from PIL import Image
+                    img = Image.open(str(img_path))
+                    px_w, px_h = img.size
+                    nat_w = px_w / 96.0
+                    nat_h = px_h / 96.0
+                    w, h = _parse_graphics_size(opts, img_path)
+                    if h is not None and w is None:
+                        w = nat_w * (h / nat_h)
+                    if w is None:
+                        w = 4.0
+                        h = nat_h * (w / nat_w)
+                    if w > TEXT_WIDTH_INCHES:
+                        scale = TEXT_WIDTH_INCHES / w
+                        w *= scale
+                        h *= scale
+                    p.add_run().add_picture(str(img_path), width=Inches(w), height=Inches(h))
+                except Exception:
+                    _run(p, f"[Figure: {img_name}]", italic=True)
+            else:
+                _run(p, f"[Figure: {img_name}]", italic=True)
+            pos += img_m.end()
             continue
 
         # \end{...} — should not appear here if extract_env worked, but skip it
@@ -3297,10 +3492,17 @@ def extract_tables_to_temp(source: str, temp_dir: Path) -> int:
         content = re.sub(r"\\resizebox\{[^}]*\}\{[^}]*\}\{?", "", content)
         content = content.rstrip("}")  # Remover el cierre del resizebox si existe
         
+        # Normalizar el especificador de columnas: Pandoc no entiende bien @{} y
+        # genera una sola fila con todas las celdas. Se eliminan esos separadores
+        # antes de delegar la conversión a Pandoc.
+        col_spec, rest = _strip_column_spec(content)
+        if col_spec:
+            clean_spec = re.sub(r"@\{[^}]*\}", "", col_spec)
+            content = "{" + clean_spec + "}" + rest
+
         # Guardar archivo .tex (keep inline math $...$ intact for Pandoc)
         tex_file = temp_dir / f"tabla_{table_count:02d}_{env_name}.tex"
         tex_file.write_text(f"\\begin{{{env_name}}}" + content + f"\\end{{{env_name}}}", encoding="utf-8")
-    
     return table_count
 
 
@@ -3479,7 +3681,6 @@ def main():
         print(f"[OK] Guardado: {out_path}")
         
     finally:
-        # Limpiar carpeta temporal
         import shutil
         shutil.rmtree(temp_dir, ignore_errors=True)
 
