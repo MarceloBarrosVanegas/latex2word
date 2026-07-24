@@ -260,17 +260,20 @@ def _safe_page_break(doc: Document):
 
 
 def _remove_empty_paragraphs_after_tables(doc: Document):
-    """Leave one compact empty paragraph after each table.
+    """Ensure a comfortable gap after each table.
 
     Pandoc usually emits one or more empty paragraphs right after a table.
-    Removing all of them makes the text look glued to the table; keeping the
-    first one with a small space_after gives a predictable, comfortable gap.
+    Removing all of them makes the text look glued to the table; keeping one
+    separator paragraph with a generous space_after gives a predictable gap.
+    For tables that have no following paragraph, a separator is inserted.
     """
     body = doc.element.body
     removed = 0
     compacted = 0
-    # Recorrer de atrás hacia adelante para que eliminar párrafos no cambie
-    # el hermano siguiente de las tablas anteriores.
+    added = 0
+
+    # Recorrer de atrás hacia adelante para que eliminar/insertar párrafos no
+    # cambie la posición de las tablas anteriores.
     for tbl in reversed(list(body.findall(qn('w:tbl')))):
         empties = []
         nxt = tbl.getnext()
@@ -282,23 +285,26 @@ def _remove_empty_paragraphs_after_tables(doc: Document):
             else:
                 break
 
-        if not empties:
-            continue
+        if empties:
+            # Keep the first empty paragraph, delete any extras.
+            for p in empties[1:]:
+                p.getparent().remove(p)
+                removed += 1
+            sep = Paragraph(empties[0], doc)
+        else:
+            # Insert a separator paragraph right after the table.
+            new_p = OxmlElement("w:p")
+            tbl.addnext(new_p)
+            sep = Paragraph(new_p, doc)
+            added += 1
 
-        # Keep the first empty paragraph, delete any extras.
-        for p in empties[1:]:
-            p.getparent().remove(p)
-            removed += 1
-
-        # Compact the remaining separator paragraph but keep a small gap.
-        sep = Paragraph(empties[0], doc)
-        sep.paragraph_format.space_after = Pt(6)
+        sep.paragraph_format.space_after = Pt(12)
         sep.paragraph_format.space_before = Pt(0)
         sep.paragraph_format.line_spacing = 1.0
         compacted += 1
 
-    if removed or compacted:
-        print(f"  [INFO] Ajustados {compacted} espacios tras tablas, eliminados {removed} párrafos vacíos extra")
+    if removed or added or compacted:
+        print(f"  [INFO] Ajustados {compacted} espacios tras tablas, eliminados {removed} párrafos vacíos extra, agregados {added}")
 
 
 def _insert_toc_field(doc: Document, instr: str, title: str = "", placeholder: str = ""):
@@ -1394,52 +1400,113 @@ def _flatten_single_cell_tabulars(content: str) -> str:
     Authors often wrap a cell header in \\begin{tabular}[c]{@{}c@{}}text
     \\end{tabular} to centre it. Pandoc leaves the wrapper visible, so we
     flatten it when the inner content is clearly a single cell (no row or
-    column separators). The regex only matches innermost tabulars so it
-    never accidentally consumes the outer table.
+    column separators). Innermost tabulars are flattened first so we never
+    accidentally consume the outer table.
 
     If the tabular is wrapped in a formatting command such as \\textbf,
     the wrapper is preserved so the cell keeps its original formatting.
     """
-    fmt_cmds = r"textbf|textit|emph|textsl|textsc|texttt|underline"
-
-    # Match an innermost tabular, optionally preceded by \fmt{ and closed by }.
-    pattern = re.compile(
-        r"(\\(?:" + fmt_cmds + r")\{)?"
-        r"\\begin\{tabular\}(?:\[[^\]]*\])?"
-        r"\{(?:[^{}]|\{[^{}]*\})*\}\s*"
-        r"((?:(?!\\begin\{tabular\}|\\end\{tabular\}).)*?)"
-        r"\\end\{tabular\}"
-        r"(\})?",
-        re.DOTALL
-    )
+    fmt_cmds = {"textbf", "textit", "emph", "textsl", "textsc", "texttt", "underline"}
 
     changed = True
     while changed:
         changed = False
+        pos = 0
+        result: list[str] = []
 
-        def replace(match: re.Match) -> str:
-            nonlocal changed
-            fmt_open = match.group(1) or ""
-            fmt_close = match.group(3) or ""
-            inner = match.group(2).strip()
+        while True:
+            # Find the next \begin{tabular} (with optional [...])
+            m = re.search(r"\\begin\{tabular\}(?:\[[^\]]*\])?", content[pos:])
+            if not m:
+                break
+            start_env = pos + m.start()
+            after_begin = pos + m.end()
 
-            # If it looks like a real nested table, keep it.
-            if "\\\\" in inner or "&" in inner:
-                return match.group(0)
+            # Column spec must be a balanced {...}
+            if after_begin >= len(content) or content[after_begin] != "{":
+                result.append(content[pos:after_begin])
+                pos = after_begin
+                continue
 
-            # If we captured an opening brace but no closing one (or vice versa),
-            # leave the original unchanged to avoid breaking brace balance.
-            open_braces = (fmt_open + inner + fmt_close).count("{")
-            close_braces = (fmt_open + inner + fmt_close).count("}")
-            if open_braces != close_braces:
-                return match.group(0)
+            col_spec = _extract_balanced_braces(content, after_begin)
+            if col_spec is None:
+                result.append(content[pos:after_begin])
+                pos = after_begin
+                continue
 
+            after_spec = after_begin + len(col_spec) + 2
+            end_env = content.find("\\end{tabular}", after_spec)
+            if end_env == -1:
+                result.append(content[pos:after_spec])
+                pos = after_spec
+                continue
+
+            body = content[after_spec:end_env]
+
+            # If the body still contains a nested tabular, leave this match for
+            # the next iteration so innermost tabulars are flattened first.
+            if "\\begin{tabular}" in body:
+                result.append(content[pos:after_spec])
+                pos = after_spec
+                continue
+
+            # If it looks like a real multi-cell table, keep it.
+            if "&" in body or "\\\\" in body:
+                result.append(content[pos:end_env + len("\\end{tabular}")])
+                pos = end_env + len("\\end{tabular}")
+                continue
+
+            # Detect an optional surrounding formatting command: \fmt{...tabular...}
+            fmt_open = ""
+            fmt_close = ""
+            before = content[:start_env]
+            for cmd in fmt_cmds:
+                prefix = f"\\{cmd}{{"
+                if before.endswith(prefix):
+                    closing = end_env + len("\\end{tabular}")
+                    if closing < len(content) and content[closing] == "}":
+                        fmt_open = prefix
+                        fmt_close = "}"
+                        break
+
+            replacement = fmt_open + body.strip() + fmt_close
+
+            # Preserve brace balance to avoid breaking the rest of the source.
+            if replacement.count("{") != replacement.count("}"):
+                result.append(content[pos:end_env + len("\\end{tabular}")])
+                pos = end_env + len("\\end{tabular}")
+                continue
+
+            result.append(content[pos:start_env])
+            result.append(replacement)
+            pos = end_env + len("\\end{tabular}") + (1 if fmt_close else 0)
             changed = True
-            return fmt_open + inner + fmt_close
 
-        content = pattern.sub(replace, content)
+        result.append(content[pos:])
+        content = "".join(result)
 
     return content
+
+
+def _is_plain_text_cell(line: str) -> bool:
+    """Return True if a cell only contains text formatting commands.
+
+    In array environments authors often write \text{...} or \textbf{...}
+    for labels. These should render as normal text, not as OMML equations,
+    so they keep the table font size and accept bold/italic formatting.
+    """
+    if not line.strip():
+        return True
+    # Strip text-formatting commands (allowing one level of nested braces).
+    cleaned = re.sub(r"\\text[a-zA-Z]*\{(?:[^{}]|\{[^{}]*\})*\}", "", line)
+    cleaned = cleaned.strip()
+    # If nothing remains, it was plain text.
+    if not cleaned:
+        return True
+    # Any remaining backslash means there is real math/typesetting content.
+    if "\\" in cleaned:
+        return False
+    return True
 
 
 def _parse_col_widths_dxa(col_spec: str, n_cols: int,
@@ -2224,7 +2291,7 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
             seen_headers.add(row_hash)
 
             valid_rows.append(row)
-        
+
         # Fusionar filas de header consecutivas que sean complementarias.
         # Esto ocurre cuando un header de LaTeX ocupa varias filas y cada celda
         # solo tiene texto en una de esas filas (ej. fila 1: nombres de columnas
@@ -2348,6 +2415,20 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
                                 run_color = src_color if is_header_cell else (source_run.font.color.rgb if source_run.font.color and source_run.font.color.rgb else None)
                                 if run_color:
                                     new_run.font.color.rgb = run_color
+
+                        # If this is a merged header cell whose source was empty, make
+                        # sure the merged text is written even though there were no runs.
+                        if is_header_cell and header_text and not new_cell.text.strip():
+                            new_para = new_cell.paragraphs[0] if new_cell.paragraphs else new_cell.add_paragraph()
+                            for run in list(new_para.runs):
+                                run._element.getparent().remove(run._element)
+                            new_run = new_para.add_run(header_text)
+                            new_run.font.name = FONT
+                            new_run.font.size = Pt(font_size)
+                            new_run.bold = src_bold
+                            new_run.italic = src_italic
+                            if src_color:
+                                new_run.font.color.rgb = src_color
         
         # Aplicar estilo booktabs (solo líneas horizontales)
         apply_booktabs_style(new_table)
@@ -2562,21 +2643,17 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
 
                 # En tablas array (\begin{array} en modo math), envolver cada
                 # celda en $...$ para que Pandoc la convierta a OMML, salvo que
-                # ya contenga math inline.
-                if is_array and "$" not in line:
+                # ya contenga math inline o sea solo texto (\text{...}).
+                if is_array and "$" not in line and not _is_plain_text_cell(line):
                     line = f"${line}$"
 
                 # Sanitize any stray marker characters that leaked through
                 line = line.replace("\x00SJ\x00", "\\\\").replace("\x00NL\x00", "\\\\")
-                if ri == header_row_idx:
-                    if '$' in line:
-                        parse_inline(p, line, base_sz=PT_SMALL)
-                        for run in p.runs:
-                            run.bold = True
-                    else:
-                        _run(p, strip_fmt(line), bold=True, size=PT_SMALL)
-                else:
-                    parse_inline(p, line, base_sz=PT_SMALL)
+
+                # Parse inline formatting respecting LaTeX commands (bold, italic,
+                # math). For arrays, plain-text cells stay as normal text so they
+                # match the table font size instead of becoming large OMML.
+                parse_inline(p, line, base_sz=PT_SMALL)
 
     apply_booktabs_style(table)
     doc.add_paragraph()
@@ -3635,6 +3712,17 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 inner = re.sub(r"\\endfirsthead.*?\\endhead",     "", inner, flags=re.DOTALL)
                 inner = re.sub(r"\\endfoot.*?\\endlastfoot",       "", inner, flags=re.DOTALL)
                 inner = _remove_captions(inner)
+                # Remove labels that are no longer needed and any orphaned row
+                # separators left by caption/head removal.
+                inner = re.sub(r"\\label\{[^}]*\}", "", inner)
+                inner = re.sub(r"^\s*(?:\\\\(?:\[[^\]]*\])?\s*)+", "", inner)
+                inner = re.sub(r"\s*(?:\\\\(?:\[[^\]]*\])?\s*)+$", "", inner)
+                # Collapse empty separator lines between horizontal rules.
+                inner = re.sub(
+                    r"(\s*\\(?:toprule|midrule|bottomrule|hline)\b)\s*(?:\\\\(?:\[[^\]]*\])?\s*)+(?=\\(?:toprule|midrule|bottomrule|hline)\b)",
+                    r"\1\n", inner
+                )
+                inner = inner.strip()
                 render_table(doc, inner, caption, col_spec=col_spec)
 
             elif env_name in ("tabular", "tabularx"):
