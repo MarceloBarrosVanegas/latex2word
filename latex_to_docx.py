@@ -2468,6 +2468,31 @@ def _has_complex_col_spec(col_spec: str) -> bool:
     return bool(re.search(r">\s*\{[^}]*\}", col_spec))
 
 
+def _scale_omml_in_paragraph(paragraph, pt_size: int):
+    """Clone and scale down any OMML equations inside a paragraph.
+
+    Pandoc renders inline/display math with the document's default equation
+    size (11 pt). Inside table cells we want them to match the surrounding
+    table font, so we set <m:sz> on every math run property. The element is
+    cloned first so the OMML cache is not modified.
+    """
+    sz_val = str(int(pt_size * 2))  # half-points
+    math_tags = (f"{{{MATH_NS}}}oMath", f"{{{MATH_NS}}}oMathPara")
+
+    for child in list(paragraph._p):
+        if child.tag not in math_tags:
+            continue
+        cloned = etree.fromstring(etree.tostring(child))
+        for r_pr in cloned.iter(qn("m:rPr")):
+            sz = r_pr.find(qn("m:sz"))
+            if sz is None:
+                sz = OxmlElement("m:sz")
+                r_pr.append(sz)
+            sz.set(qn("m:val"), sz_val)
+        child.addnext(cloned)
+        child.getparent().remove(child)
+
+
 def render_table(doc: Document, tab_inner: str, caption: str = "",
                  ncols_hint: int = 0, col_widths_dxa: list = None,
                  col_spec: str = "", is_array: bool = False):
@@ -2654,6 +2679,11 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
                 # math). For arrays, plain-text cells stay as normal text so they
                 # match the table font size instead of becoming large OMML.
                 parse_inline(p, line, base_sz=PT_SMALL)
+
+                # Inside array tables, scale down equations so they match the
+                # surrounding table font instead of using Word's default 11 pt.
+                if is_array:
+                    _scale_omml_in_paragraph(p, PT_SMALL)
 
     apply_booktabs_style(table)
     doc.add_paragraph()
