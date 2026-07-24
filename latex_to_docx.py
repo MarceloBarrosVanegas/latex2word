@@ -2229,8 +2229,11 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
         # Esto ocurre cuando un header de LaTeX ocupa varias filas y cada celda
         # solo tiene texto en una de esas filas (ej. fila 1: nombres de columnas
         # desde la columna 2; fila 2: nombre de la columna 1).
+        header_merged_texts: list[str] = []
+        header_format_cells: list = []
         if valid_rows:
             merged = [cell.text.strip() for cell in valid_rows[0].cells]
+            format_cells = list(valid_rows[0].cells)
             i = 1
             while i < len(valid_rows):
                 next_texts = [cell.text.strip() for cell in valid_rows[i].cells]
@@ -2241,12 +2244,13 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
                     break
                 if not any(next_texts):
                     break
+                for j, (a, b, cell) in enumerate(zip(merged, next_texts, valid_rows[i].cells)):
+                    if not a and b:
+                        format_cells[j] = cell
                 merged = [a or b for a, b in zip(merged, next_texts)]
                 valid_rows.pop(i)
-            # Aplicar el header fusionado a la primera fila
-            for j, cell in enumerate(valid_rows[0].cells):
-                if merged[j]:
-                    cell.text = merged[j]
+            header_merged_texts = merged
+            header_format_cells = format_cells
 
         if not valid_rows:
             print(f'  [WARN] Tabla {table_num} solo tiene filas de continuación')
@@ -2263,6 +2267,20 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
             font_size = 7  # Muy ancha -> fuente pequena
         elif ncols > 5:
             font_size = 8  # Moderadamente ancha
+        
+        def _cell_format_flags(cell):
+            """Return (bold, italic, color) inferred from the cell's runs."""
+            bold = italic = False
+            color = None
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    if run.bold:
+                        bold = True
+                    if run.italic:
+                        italic = True
+                    if run.font.color and run.font.color.rgb:
+                        color = run.font.color.rgb
+            return bold, italic, color
         
         # Copiar contenido celda por celda PRESERVANDO formato
         for i, source_row in enumerate(valid_rows):
@@ -2289,27 +2307,47 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
                         new_cell = new_row.cells[j]
                         new_cell.text = ""
                         
+                        # If this is the (possibly merged) header row, use the merged
+                        # text but keep the formatting of the source cell that provided it.
+                        is_header_cell = (i == 0 and header_merged_texts and j < len(header_merged_texts))
+                        header_text = header_merged_texts[j] if is_header_cell else None
+                        format_source = header_format_cells[j] if is_header_cell else source_cell
+                        src_bold, src_italic, src_color = _cell_format_flags(format_source)
+                        
                         for source_para in source_cell.paragraphs:
                             has_math = any(child.tag.startswith(f"{{{MATH_NS}}}") for child in source_para._p)
                             if not source_para.text.strip() and not has_math:
                                 continue
                             new_para = new_cell.paragraphs[0] if new_cell.paragraphs else new_cell.add_paragraph()
-                            new_para.text = source_para.text
                             new_para.alignment = source_para.alignment
+
+                            # Remove placeholder run so we can rebuild the paragraph
+                            # preserving Pandoc's formatting (bold, italic, etc.).
+                            for run in list(new_para.runs):
+                                run._element.getparent().remove(run._element)
+
                             # Copy OMML math elements (Pandoc produces these inline)
                             if has_math:
                                 for child in source_para._p:
                                     if child.tag.startswith(f"{{{MATH_NS}}}"):
                                         cloned = etree.fromstring(etree.tostring(child))
                                         new_para._p.append(cloned)
+
+                            # Copy runs one by one, preserving source formatting.
+                            # For merged header cells we replace the text while keeping
+                            # the format of the cell that originally held the content.
                             for source_run in source_para.runs:
-                                for run in new_para.runs:
-                                    run.font.name = FONT
-                                    run.font.size = Pt(font_size)
-                                    if source_run.bold:
-                                        run.bold = True
-                                    if source_run.italic:
-                                        run.italic = True
+                                run_text = header_text if (is_header_cell and source_run.text.strip()) else source_run.text
+                                if is_header_cell and not run_text:
+                                    continue
+                                new_run = new_para.add_run(run_text)
+                                new_run.font.name = FONT
+                                new_run.font.size = Pt(font_size)
+                                new_run.bold = src_bold if is_header_cell else source_run.bold
+                                new_run.italic = src_italic if is_header_cell else source_run.italic
+                                run_color = src_color if is_header_cell else (source_run.font.color.rgb if source_run.font.color and source_run.font.color.rgb else None)
+                                if run_color:
+                                    new_run.font.color.rgb = run_color
         
         # Aplicar estilo booktabs (solo líneas horizontales)
         apply_booktabs_style(new_table)
