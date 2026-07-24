@@ -1872,21 +1872,28 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
 
             valid_rows.append(row)
         
-        # Combinar headers de dos filas cuando la primera fila tiene la primera
-        # celda vacía y la segunda fila solo tiene texto en la primera celda.
-        # Ejemplo LaTeX:
-        #     & count & mean & std & min & 25% & 50% & 75% & max \\
-        # outfall &  &  &  &  &  &  &  &  \\
-        if len(valid_rows) >= 2:
-            row0_texts = [cell.text.strip() for cell in valid_rows[0].cells]
-            row1_texts = [cell.text.strip() for cell in valid_rows[1].cells]
-            if (not row0_texts[0] and
-                all(row0_texts[1:]) and
-                row1_texts[0] and
-                not any(row1_texts[1:])):
-                # Fusionar: primera celda de row1 + resto de row0
-                valid_rows[0].cells[0].text = row1_texts[0]
-                valid_rows.pop(1)
+        # Fusionar filas de header consecutivas que sean complementarias.
+        # Esto ocurre cuando un header de LaTeX ocupa varias filas y cada celda
+        # solo tiene texto en una de esas filas (ej. fila 1: nombres de columnas
+        # desde la columna 2; fila 2: nombre de la columna 1).
+        if valid_rows:
+            merged = [cell.text.strip() for cell in valid_rows[0].cells]
+            i = 1
+            while i < len(valid_rows):
+                next_texts = [cell.text.strip() for cell in valid_rows[i].cells]
+                if len(next_texts) != len(merged):
+                    break
+                # Filas complementarias: en cada columna, al menos una celda está vacía.
+                if not all((not a or not b) for a, b in zip(merged, next_texts)):
+                    break
+                if not any(next_texts):
+                    break
+                merged = [a or b for a, b in zip(merged, next_texts)]
+                valid_rows.pop(i)
+            # Aplicar el header fusionado a la primera fila
+            for j, cell in enumerate(valid_rows[0].cells):
+                if merged[j]:
+                    cell.text = merged[j]
 
         if not valid_rows:
             print(f'  [WARN] Tabla {table_num} solo tiene filas de continuación')
