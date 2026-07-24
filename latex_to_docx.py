@@ -1359,8 +1359,20 @@ def _strip_column_spec(text: str):
     Remove the first balanced {col_spec} block from text.
     Returns (col_spec_content, rest_of_text).
     Handles nested braces like p{0.06\\textwidth}.
+    Also skips an optional [...] prefix (e.g. \begin{longtable}[H]{...}).
     """
     text = text.lstrip()
+    # Skip optional environment argument such as [H] or [c] before the spec.
+    if text.startswith("["):
+        depth = 1
+        for i, c in enumerate(text[1:], start=1):
+            if c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
+                    text = text[i + 1:].lstrip()
+                    break
     if not text.startswith("{"):
         return "", text
     depth = 0
@@ -1374,6 +1386,8 @@ def _strip_column_spec(text: str):
     return "", text
 
 
+
+
 def _flatten_single_cell_tabulars(content: str) -> str:
     """Replace nested single-cell tabulars with their inner text.
 
@@ -1382,15 +1396,20 @@ def _flatten_single_cell_tabulars(content: str) -> str:
     flatten it when the inner content is clearly a single cell (no row or
     column separators). The regex only matches innermost tabulars so it
     never accidentally consumes the outer table.
+
+    If the tabular is wrapped in a formatting command such as \\textbf,
+    the wrapper is preserved so the cell keeps its original formatting.
     """
-    # Match an innermost tabular: its body cannot contain another
-    # \begin{tabular} or \end{tabular}. The column spec may itself contain
-    # nested braces (e.g. {@{}c@{}}), so we allow one level of nesting.
+    fmt_cmds = r"textbf|textit|emph|textsl|textsc|texttt|underline"
+
+    # Match an innermost tabular, optionally preceded by \fmt{ and closed by }.
     pattern = re.compile(
+        r"(\\(?:" + fmt_cmds + r")\{)?"
         r"\\begin\{tabular\}(?:\[[^\]]*\])?"
         r"\{(?:[^{}]|\{[^{}]*\})*\}\s*"
         r"((?:(?!\\begin\{tabular\}|\\end\{tabular\}).)*?)"
-        r"\\end\{tabular\}",
+        r"\\end\{tabular\}"
+        r"(\})?",
         re.DOTALL
     )
 
@@ -1400,12 +1419,23 @@ def _flatten_single_cell_tabulars(content: str) -> str:
 
         def replace(match: re.Match) -> str:
             nonlocal changed
-            inner = match.group(1).strip()
+            fmt_open = match.group(1) or ""
+            fmt_close = match.group(3) or ""
+            inner = match.group(2).strip()
+
             # If it looks like a real nested table, keep it.
             if "\\\\" in inner or "&" in inner:
                 return match.group(0)
+
+            # If we captured an opening brace but no closing one (or vice versa),
+            # leave the original unchanged to avoid breaking brace balance.
+            open_braces = (fmt_open + inner + fmt_close).count("{")
+            close_braces = (fmt_open + inner + fmt_close).count("}")
+            if open_braces != close_braces:
+                return match.group(0)
+
             changed = True
-            return inner
+            return fmt_open + inner + fmt_close
 
         content = pattern.sub(replace, content)
 
