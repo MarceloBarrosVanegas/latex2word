@@ -264,7 +264,7 @@ def _remove_empty_paragraphs_after_tables(doc: Document):
 
     Pandoc usually emits one or more empty paragraphs right after a table.
     Removing all of them makes the text look glued to the table; keeping the
-    first one with zero space_after gives a small, predictable gap.
+    first one with a small space_after gives a predictable, comfortable gap.
     """
     body = doc.element.body
     removed = 0
@@ -290,9 +290,9 @@ def _remove_empty_paragraphs_after_tables(doc: Document):
             p.getparent().remove(p)
             removed += 1
 
-        # Compact the remaining separator paragraph.
+        # Compact the remaining separator paragraph but keep a small gap.
         sep = Paragraph(empties[0], doc)
-        sep.paragraph_format.space_after = Pt(0)
+        sep.paragraph_format.space_after = Pt(6)
         sep.paragraph_format.space_before = Pt(0)
         sep.paragraph_format.line_spacing = 1.0
         compacted += 1
