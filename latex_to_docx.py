@@ -1859,19 +1859,39 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
             # Detectar filas de continuación
             if is_continuation_row_cells(row_texts):
                 continue
-            
+
+            # Detectar filas completamente vacías (residuos de \midrule, \endhead, etc.)
+            if not any(row_texts):
+                continue
+
             # Detectar headers duplicados (fila completamente idéntica a una vista antes)
             row_hash = tuple(normalize_text(t) for t in row_texts)
             if row_hash in seen_headers:
                 continue  # Skip fila duplicada
             seen_headers.add(row_hash)
-            
+
             valid_rows.append(row)
         
+        # Combinar headers de dos filas cuando la primera fila tiene la primera
+        # celda vacía y la segunda fila solo tiene texto en la primera celda.
+        # Ejemplo LaTeX:
+        #     & count & mean & std & min & 25% & 50% & 75% & max \\
+        # outfall &  &  &  &  &  &  &  &  \\
+        if len(valid_rows) >= 2:
+            row0_texts = [cell.text.strip() for cell in valid_rows[0].cells]
+            row1_texts = [cell.text.strip() for cell in valid_rows[1].cells]
+            if (not row0_texts[0] and
+                all(row0_texts[1:]) and
+                row1_texts[0] and
+                not any(row1_texts[1:])):
+                # Fusionar: primera celda de row1 + resto de row0
+                valid_rows[0].cells[0].text = row1_texts[0]
+                valid_rows.pop(1)
+
         if not valid_rows:
             print(f'  [WARN] Tabla {table_num} solo tiene filas de continuación')
             return False
-        
+
         # Crear nueva tabla solo con filas válidas
         ncols = len(source_table.columns)
         new_table = doc.add_table(rows=len(valid_rows), cols=ncols)
