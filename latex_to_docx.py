@@ -30,6 +30,7 @@ from copy import deepcopy
 
 from dataclasses import dataclass, field
 from docx import Document
+from docx.text.paragraph import Paragraph
 from docx.shared import Pt, Inches, Cm, Mm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
@@ -259,24 +260,45 @@ def _safe_page_break(doc: Document):
 
 
 def _remove_empty_paragraphs_after_tables(doc: Document):
-    """Remove empty paragraphs that Pandoc leaves immediately after tables.
+    """Leave one compact empty paragraph after each table.
 
-    A paragraph is considered empty when it has no visible text (it may still
-    contain paragraph properties or a page-break run, which are preserved).
+    Pandoc usually emits one or more empty paragraphs right after a table.
+    Removing all of them makes the text look glued to the table; keeping the
+    first one with zero space_after gives a small, predictable gap.
     """
     body = doc.element.body
     removed = 0
-    # Recorrer de atrás hacia adelante para que eliminar un párrafo no cambie
+    compacted = 0
+    # Recorrer de atrás hacia adelante para que eliminar párrafos no cambie
     # el hermano siguiente de las tablas anteriores.
     for tbl in reversed(list(body.findall(qn('w:tbl')))):
+        empties = []
         nxt = tbl.getnext()
-        if nxt is not None and nxt.tag == qn('w:p'):
+        while nxt is not None and nxt.tag == qn('w:p'):
             text = ''.join(nxt.itertext()).strip()
             if not text:
-                nxt.getparent().remove(nxt)
-                removed += 1
-    if removed:
-        print(f"  [INFO] Eliminados {removed} párrafos vacíos después de tablas")
+                empties.append(nxt)
+                nxt = nxt.getnext()
+            else:
+                break
+
+        if not empties:
+            continue
+
+        # Keep the first empty paragraph, delete any extras.
+        for p in empties[1:]:
+            p.getparent().remove(p)
+            removed += 1
+
+        # Compact the remaining separator paragraph.
+        sep = Paragraph(empties[0], doc)
+        sep.paragraph_format.space_after = Pt(0)
+        sep.paragraph_format.space_before = Pt(0)
+        sep.paragraph_format.line_spacing = 1.0
+        compacted += 1
+
+    if removed or compacted:
+        print(f"  [INFO] Ajustados {compacted} espacios tras tablas, eliminados {removed} párrafos vacíos extra")
 
 
 def _insert_toc_field(doc: Document, instr: str, title: str = "", placeholder: str = ""):
