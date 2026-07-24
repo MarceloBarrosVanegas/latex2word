@@ -29,7 +29,7 @@ from pathlib import Path
 from copy import deepcopy
 
 from docx import Document
-from docx.shared import Pt, Inches, Cm, RGBColor
+from docx.shared import Pt, Inches, Cm, Mm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 from docx.oxml.ns import qn
@@ -146,10 +146,17 @@ def _add_tc_field(paragraph, text: str, identifier: str):
 def _safe_page_break(doc: Document):
     """Add a page break only if the document does not already end with one.
     Also strips trailing empty paragraphs to avoid blank pages."""
-    # Remove trailing completely empty paragraphs (no text, no runs)
+    # Remove trailing completely empty paragraphs (no text, no runs, no math)
     while doc.paragraphs:
         last_p = doc.paragraphs[-1]
         has_content = bool(last_p.text.strip()) or len(last_p.runs) > 0
+        if not has_content:
+            # Equations are added as OMML children, not runs; keep those paragraphs.
+            for child in last_p._p:
+                tag = child.tag
+                if tag == f"{{{MATH_NS}}}oMath" or tag == f"{{{MATH_NS}}}oMathPara":
+                    has_content = True
+                    break
         if not has_content:
             last_p._element.getparent().remove(last_p._element)
         else:
@@ -164,6 +171,27 @@ def _safe_page_break(doc: Document):
                     return  # Already a page break, skip
 
     doc.add_page_break()
+
+
+def _remove_empty_paragraphs_after_tables(doc: Document):
+    """Remove empty paragraphs that Pandoc leaves immediately after tables.
+
+    A paragraph is considered empty when it has no visible text (it may still
+    contain paragraph properties or a page-break run, which are preserved).
+    """
+    body = doc.element.body
+    removed = 0
+    # Recorrer de atrás hacia adelante para que eliminar un párrafo no cambie
+    # el hermano siguiente de las tablas anteriores.
+    for tbl in reversed(list(body.findall(qn('w:tbl')))):
+        nxt = tbl.getnext()
+        if nxt is not None and nxt.tag == qn('w:p'):
+            text = ''.join(nxt.itertext()).strip()
+            if not text:
+                nxt.getparent().remove(nxt)
+                removed += 1
+    if removed:
+        print(f"  [INFO] Eliminados {removed} párrafos vacíos después de tablas")
 
 
 def _insert_toc_field(doc: Document, instr: str, title: str = "", placeholder: str = ""):
@@ -753,19 +781,82 @@ def parse_preamble(src: str) -> dict:
 # Document setup
 # ─────────────────────────────────────────────────────────────────────────────
 
-def setup_document(doc: Document):
+def _parse_length(value: str):
+    """Convert a LaTeX length like '2.0cm', '1.5in', '10pt' to a docx length object."""
+    value = value.strip()
+    m = re.match(r"([\d.]+)\s*([a-zA-Z]+)", value)
+    if not m:
+        return None
+    num = float(m.group(1))
+    unit = m.group(2).lower()
+    if unit == "cm":
+        return Cm(num)
+    elif unit == "mm":
+        return Mm(num)
+    elif unit == "in":
+        return Inches(num)
+    elif unit == "pt":
+        return Pt(num)
+    elif unit == "em":
+        # Approximate em as 12 pt (matches LaTeX default)
+        return Pt(num * 12)
+    elif unit == "ex":
+        return Pt(num * 5)
+    return None
+
+
+def parse_geometry(preamble: str) -> dict:
+    """Extract margin values from \\usepackage[...]{geometry} in the preamble."""
+    geom_m = re.search(r"\\usepackage\[(.*?)\]\{geometry\}", preamble, re.DOTALL)
+    if not geom_m:
+        return {}
+    opts = geom_m.group(1)
+    margins = {}
+    for opt in re.split(r",\s*", opts):
+        if "=" not in opt:
+            continue
+        key, val = opt.split("=", 1)
+        key = key.strip().lower()
+        val = val.strip()
+        if key in ("left", "lmargin"):
+            margins["left"] = _parse_length(val)
+        elif key in ("right", "rmargin"):
+            margins["right"] = _parse_length(val)
+        elif key in ("top", "tmargin"):
+            margins["top"] = _parse_length(val)
+        elif key in ("bottom", "bmargin"):
+            margins["bottom"] = _parse_length(val)
+        elif key == "margin":
+            length = _parse_length(val)
+            if length is not None:
+                margins.setdefault("left", length)
+                margins.setdefault("right", length)
+                margins.setdefault("top", length)
+                margins.setdefault("bottom", length)
+    return margins
+
+
+def setup_document(doc: Document, margins: dict = None):
     """Page size (A4), margins, and base styles."""
     sec = doc.sections[0]
     sec.page_width    = Inches(8.27)
     sec.page_height   = Inches(11.69)
-    sec.top_margin    = Cm(2.5)
-    sec.bottom_margin = Cm(2.0)
-    sec.left_margin   = Cm(2.54)
-    sec.right_margin  = Cm(2.54)
+    if margins:
+        sec.top_margin    = margins.get("top", margins.get("tmargin", Cm(2.5)))
+        sec.bottom_margin = margins.get("bottom", margins.get("bmargin", Cm(2.0)))
+        sec.left_margin   = margins.get("left", margins.get("lmargin", Cm(2.54)))
+        sec.right_margin  = margins.get("right", margins.get("rmargin", Cm(2.54)))
+    else:
+        sec.top_margin    = Cm(2.5)
+        sec.bottom_margin = Cm(2.0)
+        sec.left_margin   = Cm(2.54)
+        sec.right_margin  = Cm(2.54)
 
     doc.styles["Normal"].font.name = FONT
     doc.styles["Normal"].font.size = Pt(PT_NORM)
     doc.styles["Normal"].paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    doc.styles["Normal"].paragraph_format.space_before = Pt(0)
+    doc.styles["Normal"].paragraph_format.space_after = Pt(0)
 
     heading_cfg = {
         "Heading 1": (14, True,  True),
@@ -1300,6 +1391,7 @@ def is_continuation_row_cells(cells_texts: list) -> bool:
             'continues on next page',
             'table continued',
             'continúa en la siguiente página',
+            'continua en la siguiente página',
             '(continued)'
         ]):
             return True
@@ -1765,7 +1857,7 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
             row_text = ' '.join(row_texts).lower()
             
             # Detectar filas de continuación
-            if 'continued' in row_text or 'continues on next page' in row_text:
+            if is_continuation_row_cells(row_texts):
                 continue
             
             # Detectar headers duplicados (fila completamente idéntica a una vista antes)
@@ -1842,7 +1934,6 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
         # Aplicar estilo booktabs (solo líneas horizontales)
         apply_booktabs_style(new_table)
         
-        doc.add_paragraph()  # espacio después
         print(f'  [OK] Tabla {table_num} insertada ({len(valid_rows)} de {len(source_table.rows)} filas)')
         return True
         
@@ -2929,6 +3020,7 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
         if dm:
             flush()
             p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             omml = None
             if TEMP_DIR and PANDOC_PATH:
                 try:
@@ -2939,7 +3031,6 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 p._p.append(omml)
             else:
                 math_text = strip_fmt(dm.group(1))
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 _run(p, math_text, italic=True, size=PT_NORM)
             pos = dm.end()
             continue
@@ -3233,6 +3324,7 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 # strip labels before sending to Pandoc.
                 full_env_for_pandoc = re.sub(r"\\label\{[^}]*\}", "", full_env)
                 p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 omml = None
                 if TEMP_DIR and PANDOC_PATH:
                     try:
@@ -3242,7 +3334,6 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 if omml is not None:
                     p._p.append(omml)
                 else:
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     _run(p, strip_fmt(inner), italic=True, size=PT_NORM)
 
             elif env_name == "tcolorbox":
@@ -3476,22 +3567,90 @@ def _add_para(doc: Document, raw: str, init_bold=False, init_italic=False, init_
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_tables_to_temp(source: str, temp_dir: Path) -> int:
-    """Extrae tablas del LaTeX en orden de aparicion y las guarda en carpeta temporal."""
-    # Buscar todos los entornos de tabla en orden de aparicion
-    # El source tiene backslashes simples (ya que es texto leido del archivo)
-    pattern = r"\\begin\{(longtable|tabular|tabularx)\*?\}(.*?)\\end\{\1\*?\}"
+    """Extrae tablas del LaTeX en orden de aparicion y las guarda en carpeta temporal.
+
+    Debe coincidir exactamente con lo que `_walk` renderiza como tabla:
+      - entornos table/table* que contienen tabular/tabularx
+      - entornos table/table* que contienen $\\begin{array}...\\end{array}$
+      - entornos longtable
+      - entornos tabular/tabularx directos (sin wrapper table)
+    """
     table_count = 0
-    
-    for match in re.finditer(pattern, source, re.DOTALL):
+
+    # Fase 1: entornos table/table*/longtable
+    wrapper_ranges = []   # (start, end)
+    wrapper_tables = []   # (start, env_name, content)
+
+    for base in ("table", "longtable"):
+        pos = 0
+        while True:
+            idx = source.find(f"\\begin{{{base}}}", pos)
+            if idx == -1:
+                break
+            # Permite table* / longtable* gracias a extract_env(env_base, ...)
+            m = re.match(rf"\\begin\{{{re.escape(base)}\*?\}}", source[idx:])
+            if not m:
+                pos = idx + 1
+                continue
+            result = extract_env(source, base, idx)
+            if not result:
+                pos = idx + 1
+                continue
+            start, end, inner = result
+            wrapper_ranges.append((start, end))
+
+            if base == "longtable":
+                wrapper_tables.append((start, "longtable", inner))
+            else:
+                # table/table*: preferir tabular/tabularx interno
+                found = False
+                for tenv in ("tabularx", "tabular"):
+                    tr = extract_env(inner, tenv)
+                    if tr:
+                        _, _, tab_inner = tr
+                        wrapper_tables.append((start, tenv, tab_inner))
+                        found = True
+                        break
+                if not found:
+                    # Tabla definida como \begin{array} dentro de math display
+                    arr_match = re.search(
+                        r"\$\s*\\begin\{array\}(.*?)\\end\{array\}\s*\$",
+                        inner, re.DOTALL
+                    )
+                    if arr_match:
+                        wrapper_tables.append((start, "array", arr_match.group(1)))
+            pos = end
+
+    # Fase 2: tabular/tabularx directos (no dentro de table/longtable)
+    direct_tables = []
+    for tenv in ("tabularx", "tabular"):
+        pos = 0
+        while True:
+            idx = source.find(f"\\begin{{{tenv}}}", pos)
+            if idx == -1:
+                break
+            result = extract_env(source, tenv, idx)
+            if not result:
+                pos = idx + 1
+                continue
+            start, end, inner = result
+            inside_wrapper = any(ws <= start < we for ws, we in wrapper_ranges)
+            if not inside_wrapper:
+                direct_tables.append((start, tenv, inner))
+            pos = end
+
+    # Ordenar todo por posición en el source
+    all_tables = wrapper_tables + direct_tables
+    all_tables.sort(key=lambda x: x[0])
+
+    for _, env_name, content in all_tables:
         table_count += 1
-        env_name = match.group(1)
-        content = match.group(2)
-        
+
         # Remover \resizebox si existe (como en la tabla de presupuesto)
         # \resizebox{width}{height}{content} -> solo content
         content = re.sub(r"\\resizebox\{[^}]*\}\{[^}]*\}\{?", "", content)
         content = content.rstrip("}")  # Remover el cierre del resizebox si existe
-        
+
         # Normalizar el especificador de columnas: Pandoc no entiende bien @{} y
         # genera una sola fila con todas las celdas. Se eliminan esos separadores
         # antes de delegar la conversión a Pandoc.
@@ -3500,14 +3659,24 @@ def extract_tables_to_temp(source: str, temp_dir: Path) -> int:
             clean_spec = re.sub(r"@\{[^}]*\}", "", col_spec)
             content = "{" + clean_spec + "}" + rest
 
-        # Guardar archivo .tex (keep inline math $...$ intact for Pandoc)
+        # Los entornos array se renderizan manualmente en _walk (is_array=True),
+        # pero necesitamos un archivo Pandoc "placeholder" para mantener el
+        # TABLE_COUNTER sincronizado. Convertimos el array a tabular para Pandoc.
+        write_env = env_name
+        if env_name == "array":
+            write_env = "tabular"
+
         tex_file = temp_dir / f"tabla_{table_count:02d}_{env_name}.tex"
-        tex_file.write_text(f"\\begin{{{env_name}}}" + content + f"\\end{{{env_name}}}", encoding="utf-8")
+        tex_file.write_text(
+            f"\\begin{{{write_env}}}" + content + f"\\end{{{write_env}}}",
+            encoding="utf-8"
+        )
     return table_count
 
 
 def convert_tables_with_pandoc(temp_dir: Path, pandoc_path: str = "pandoc") -> bool:
-    """Convierte todas las tablas .tex en temp_dir a .docx con Pandoc."""
+    """Convierte todas las tablas .tex en temp_dir a .docx con Pandoc.
+    Reintenta una vez si Pandoc no genera el archivo de salida."""
     tex_files = list(temp_dir.glob("tabla_*.tex"))
     if not tex_files:
         return False
@@ -3515,14 +3684,24 @@ def convert_tables_with_pandoc(temp_dir: Path, pandoc_path: str = "pandoc") -> b
     for tex_file in tex_files:
         # Nombre de salida: tabla_XX_pandoc.docx
         num_match = re.search(r'tabla_(\d+)_', tex_file.name)
-        if num_match:
-            num = num_match.group(1)
-            out_file = temp_dir / f"tabla_{num}_pandoc.docx"
-            cmd = [pandoc_path, "-f", "latex", "-t", "docx", str(tex_file), "-o", str(out_file)]
+        if not num_match:
+            continue
+        num = num_match.group(1)
+        out_file = temp_dir / f"tabla_{num}_pandoc.docx"
+        cmd = [pandoc_path, "-f", "latex", "-t", "docx", str(tex_file), "-o", str(out_file)]
+        for attempt in range(2):
             try:
-                subprocess.run(cmd, capture_output=True, check=False)
-            except Exception:
-                pass  # Si falla, continuamos
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                        check=False, timeout=60)
+                if result.returncode == 0 and out_file.exists():
+                    break
+                if attempt == 0:
+                    continue
+                print(f"  [WARN] Pandoc falló para {tex_file.name}: {result.stderr.strip()}")
+            except Exception as e:
+                if attempt == 0:
+                    continue
+                print(f"  [WARN] Error ejecutando Pandoc para {tex_file.name}: {e}")
     return True
 
 
@@ -3625,6 +3804,7 @@ def main():
         preamble_end = source.find("\\begin{document}")
         preamble = source[:preamble_end] if preamble_end != -1 else source
         parse_preamble(preamble)
+        geometry_margins = parse_geometry(preamble)
         
         # Extract header text from \rhead{...}
         header_text = ""
@@ -3658,7 +3838,7 @@ def main():
         # 4. Build document
         print("[3/3] Generando documento Word...")
         doc = Document()
-        setup_document(doc)
+        setup_document(doc, geometry_margins)
 
         # Buscar logo
         script_dir = Path(__file__).parent
@@ -3676,6 +3856,9 @@ def main():
         add_footer(doc)
 
         parse_body(doc, source, in_path.parent)
+
+        # Clean up empty paragraphs left after tables
+        _remove_empty_paragraphs_after_tables(doc)
 
         doc.save(str(out_path))
         print(f"[OK] Guardado: {out_path}")
