@@ -1374,6 +1374,44 @@ def _strip_column_spec(text: str):
     return "", text
 
 
+def _flatten_single_cell_tabulars(content: str) -> str:
+    """Replace nested single-cell tabulars with their inner text.
+
+    Authors often wrap a cell header in \\begin{tabular}[c]{@{}c@{}}text
+    \\end{tabular} to centre it. Pandoc leaves the wrapper visible, so we
+    flatten it when the inner content is clearly a single cell (no row or
+    column separators). The regex only matches innermost tabulars so it
+    never accidentally consumes the outer table.
+    """
+    # Match an innermost tabular: its body cannot contain another
+    # \begin{tabular} or \end{tabular}. The column spec may itself contain
+    # nested braces (e.g. {@{}c@{}}), so we allow one level of nesting.
+    pattern = re.compile(
+        r"\\begin\{tabular\}(?:\[[^\]]*\])?"
+        r"\{(?:[^{}]|\{[^{}]*\})*\}\s*"
+        r"((?:(?!\\begin\{tabular\}|\\end\{tabular\}).)*?)"
+        r"\\end\{tabular\}",
+        re.DOTALL
+    )
+
+    changed = True
+    while changed:
+        changed = False
+
+        def replace(match: re.Match) -> str:
+            nonlocal changed
+            inner = match.group(1).strip()
+            # If it looks like a real nested table, keep it.
+            if "\\\\" in inner or "&" in inner:
+                return match.group(0)
+            changed = True
+            return inner
+
+        content = pattern.sub(replace, content)
+
+    return content
+
+
 def _parse_col_widths_dxa(col_spec: str, n_cols: int,
                            content_dxa: int = 9026) -> list:
     """
@@ -2316,6 +2354,8 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
     cleaned_inner = re.sub(r"p\{[^}]*\}", "", tab_inner)
     cleaned_inner = re.sub(r"m\{[^}]*\}", "", cleaned_inner)
     cleaned_inner = re.sub(r"b\{[^}]*\}", "", cleaned_inner)
+    # Flatten nested single-cell tabulars used for centred headers.
+    cleaned_inner = _flatten_single_cell_tabulars(cleaned_inner)
 
     # Detect "vertical" tables where every column is p/m/b (no l/c/r/X).
     # In such tables \\ inside a cell is a line break, not a row separator.
@@ -3976,6 +4016,10 @@ def extract_tables_to_temp(source: str, temp_dir: Path) -> int:
         if col_spec:
             clean_spec = re.sub(r"@\{[^}]*\}", "", col_spec)
             content = "{" + clean_spec + "}" + rest
+
+        # Aplanar tabulares anidados de una sola celda (ej. encabezados centrados
+        # con \begin{tabular}[c]{@{}c@{}}texto\end{tabular}).
+        content = _flatten_single_cell_tabulars(content)
 
         # Los entornos array se renderizan manualmente en _walk (is_array=True),
         # pero necesitamos un archivo Pandoc "placeholder" para mantener el
