@@ -28,6 +28,7 @@ import unicodedata
 from pathlib import Path
 from copy import deepcopy
 
+from dataclasses import dataclass, field
 from docx import Document
 from docx.shared import Pt, Inches, Cm, Mm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -36,8 +37,92 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement, parse_xml
 from lxml import etree
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Colours
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────----
+
+@dataclass
+class Config:
+    """Runtime configuration populated from the LaTeX preamble and CLI defaults."""
+    # Presentation
+    font_name: str = "Calibri"
+    font_size_normal: int = 11
+    font_size_small: int = 9
+    font_size_foot: int = 8
+
+    # Page
+    page_width_inches: float = 8.27
+    page_height_inches: float = 11.69
+    margin_top = Cm(2.5)
+    margin_bottom = Cm(2.0)
+    margin_left = Cm(2.54)
+    margin_right = Cm(2.54)
+
+    # Calculated from page + margins
+    text_width_inches: float = 6.27
+    text_height_inches: float = 9.50
+
+    # Language / captions
+    language: str = "es"
+    table_name: str = "Table"
+    figure_name: str = "Figure"
+    chapter_prefix: str = "Capítulo "
+    appendix_prefix: str = "Apéndice "
+    bib_title_default: str = "Referencias"
+
+    # TOC/LOT/LOF titles and placeholders
+    toc_title: str = "TABLE OF CONTENTS"
+    lof_title: str = "LIST OF FIGURES"
+    lot_title: str = "LIST OF TABLES"
+    toc_placeholder: str = "Right-click and select Update Field to generate."
+    lof_placeholder: str = "No figure entries found. Right-click and select Update Field to generate."
+    lot_placeholder: str = "No table entries found. Right-click and select Update Field to generate."
+
+    # Executables
+    pandoc_path: str = "pandoc"
+    pdflatex_path: str = "pdflatex"
+    pdftoppm_path: str = "pdftoppm"
+
+    # Timeouts (seconds)
+    timeout_pandoc: int = 60
+    timeout_pdflatex: int = 90
+    timeout_pdftoppm: int = 30
+    timeout_math: int = 30
+
+    # Images
+    image_dpi: float = 96.0
+    image_tikz_dpi: int = 300
+    image_default_width_inches: float = 4.0
+    image_max_width_inches: float = 6.3
+
+    # Logo search candidates (relative to input .tex directory)
+    logo_candidates: list[str] = field(default_factory=lambda: [
+        "icono.png", "icono.jpg",
+        "images/logo.jpg", "images/logo.png",
+        "00_figs/logo.jpg",
+    ])
+    logo_height = Cm(0.8)
+
+    # Colours
+    color_black = RGBColor(0x00, 0x00, 0x00)
+    color_white = RGBColor(0xFF, 0xFF, 0xFF)
+    color_link = RGBColor(0x00, 0x56, 0xB3)
+    color_gray = RGBColor(0x60, 0x60, 0x60)
+    hex_header = "1F497D"
+    hex_category = "DDEEFF"
+    hex_alt = "F5F9FF"
+
+    # Fallback natural image size when Pillow cannot open the file
+    fallback_image_width: float = 4.0
+    fallback_image_height: float = 3.0
+
+
+# Global configuration instance; populated in main() from the LaTeX preamble.
+CONFIG: Config = Config()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Colours (kept as module-level constants for now)
 # ─────────────────────────────────────────────────────────────────────────────
 C_BLACK   = RGBColor(0x00, 0x00, 0x00)
 C_WHITE   = RGBColor(0xFF, 0xFF, 0xFF)
@@ -237,52 +322,66 @@ def _insert_toc_field(doc: Document, instr: str, title: str = "", placeholder: s
     ))
 
 
-def add_toc(doc: Document, title: str = "TABLE OF CONTENTS"):
+def add_toc(doc: Document, title: str | None = None, config: Config | None = None):
     """Insert a Table of Contents field (auto-updates on open)."""
+    if config is None:
+        config = CONFIG
     _insert_toc_field(
-        doc, r'TOC \o "1-3" \h \z', title,
-        "No table of contents entries found. Right-click and select Update Field to generate."
+        doc, r'TOC \o "1-3" \h \z',
+        title if title is not None else config.toc_title,
+        config.toc_placeholder
     )
 
 
-def add_lof(doc: Document, title: str = "LIST OF FIGURES"):
+def add_lof(doc: Document, title: str | None = None, config: Config | None = None):
     """Insert a List of Figures field (auto-updates on open)."""
+    if config is None:
+        config = CONFIG
     _insert_toc_field(
-        doc, r'TOC \c "Figure" \h \z', title,
-        "No figure entries found. Right-click and select Update Field to generate."
+        doc, r'TOC \c "Figure" \h \z',
+        title if title is not None else config.lof_title,
+        config.lof_placeholder
     )
 
 
-def add_lot(doc: Document, title: str = "LIST OF TABLES"):
+def add_lot(doc: Document, title: str | None = None, config: Config | None = None):
     """Insert a List of Tables field (auto-updates on open)."""
+    if config is None:
+        config = CONFIG
     _insert_toc_field(
-        doc, r'TOC \c "Table" \h \z', title,
-        "No table entries found. Right-click and select Update Field to generate."
+        doc, r'TOC \c "Table" \h \z',
+        title if title is not None else config.lot_title,
+        config.lot_placeholder
     )
 
-def add_table_caption(doc: Document, caption_text: str, table_num: int = 0):
+
+def add_table_caption(doc: Document, caption_text: str, table_num: int = 0,
+                      config: Config | None = None):
     """
     Add a table caption with a hidden TC field for Word's List of Tables.
-    Format: Table X: Caption text
     """
+    if config is None:
+        config = CONFIG
+
     clean_caption = strip_fmt(caption_text).replace('"', "'")
-    full_caption = f"Table {table_num}: {clean_caption}" if table_num > 0 else f"Table: {clean_caption}"
-    
+    prefix = config.table_name
+    full_caption = f"{prefix} {table_num}: {clean_caption}" if table_num > 0 else f"{prefix}: {clean_caption}"
+
     # Simple paragraph - no special style
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p.paragraph_format.space_before = Pt(6)
     p.paragraph_format.space_after = Pt(6)
-    
+
     # Visible caption
     r = p.add_run(full_caption)
     r.bold = True
-    r.font.size = Pt(PT_SMALL)
-    r.font.name = FONT
+    r.font.size = Pt(config.font_size_small)
+    r.font.name = config.font_name
     r.font.color.rgb = C_BLACK
-    
+
     # Hidden TC field for List of Tables
-    tc_text = f"Tabla {table_num}\t{clean_caption}" if table_num > 0 else f"Tabla\t{clean_caption}"
+    tc_text = f"{prefix} {table_num}\t{clean_caption}" if table_num > 0 else f"{prefix}\t{clean_caption}"
     _add_tc_field(p, tc_text, "T")
 
 
@@ -683,12 +782,121 @@ def parse_inline(para, text: str, base_sz=PT_NORM, bold=False, italic=False, siz
 # Preamble parser
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_preamble(src: str) -> dict:
+def _extract_simple_braced(text: str, cmd: str) -> str | None:
+    r"""Extract content of \cmd{...} allowing one level of nested braces."""
+    idx = text.find(f"\\{cmd}{{")
+    if idx == -1:
+        return None
+    start = idx + len(f"\\{cmd}{{") - 1
+    content = _extract_balanced_braces(text, start)
+    return content
+
+
+def _detect_documentclass(preamble: str) -> tuple[str, list[str]]:
+    """Return (class_name, options_list) from \\documentclass[...]{...}."""
+    m = re.search(r"\\documentclass\[(.*?)\]\{(\w+)\}", preamble, re.DOTALL)
+    if not m:
+        return "", []
+    opts = [o.strip() for o in m.group(1).split(",")]
+    return m.group(2), opts
+
+
+def _apply_documentclass_to_config(docclass: str, opts: list[str], config: Config):
+    """Infer page size and base font size from document class options."""
+    # Page size
+    if "letterpaper" in opts:
+        config.page_width_inches = 8.5
+        config.page_height_inches = 11.0
+    elif "legalpaper" in opts:
+        config.page_width_inches = 8.5
+        config.page_height_inches = 14.0
+    elif "a4paper" in opts or "a4" in opts:
+        config.page_width_inches = 8.27
+        config.page_height_inches = 11.69
+    elif "a5paper" in opts or "a5" in opts:
+        config.page_width_inches = 5.83
+        config.page_height_inches = 8.27
+
+    # Font size
+    for opt in opts:
+        if opt in ("10pt", "11pt", "12pt"):
+            config.font_size_normal = int(opt.replace("pt", ""))
+            break
+
+    # Default margins depend on class side
+    if docclass in ("report", "book"):
+        # reasonable defaults if geometry is not present
+        config.margin_left = Cm(2.54)
+        config.margin_right = Cm(2.54)
+        config.margin_top = Cm(2.5)
+        config.margin_bottom = Cm(2.0)
+    else:
+        config.margin_left = Cm(2.54)
+        config.margin_right = Cm(2.54)
+        config.margin_top = Cm(2.5)
+        config.margin_bottom = Cm(2.0)
+
+
+def _apply_language_to_config(preamble: str, config: Config):
+    """Detect babel/polyglossia language and set captions accordingly."""
+    lang = None
+    m = re.search(r"\\usepackage\[(.*?)\]\{babel\}", preamble, re.DOTALL)
+    if m:
+        opts = [o.strip().lower() for o in m.group(1).split(",")]
+        for o in opts:
+            if o in ("spanish", "english", "french", "german", "portuguese"):
+                lang = o
+                break
+    if not lang:
+        m = re.search(r"\\setmainlanguage\{(.*?)\}", preamble, re.DOTALL)
+        if m:
+            lang = m.group(1).strip().lower()
+
+    if lang == "spanish":
+        config.language = "es"
+        config.table_name = "Tabla"
+        config.figure_name = "Figura"
+        config.chapter_prefix = "Capítulo "
+        config.appendix_prefix = "Apéndice "
+        config.bib_title_default = "Referencias"
+        config.toc_title = "ÍNDICE DE CONTENIDOS"
+        config.lof_title = "ÍNDICE DE FIGURAS"
+        config.lot_title = "ÍNDICE DE TABLAS"
+        config.toc_placeholder = "Haga clic derecho y seleccione Actualizar campo para generar."
+        config.lof_placeholder = "No hay entradas de figuras. Haga clic derecho y seleccione Actualizar campo."
+        config.lot_placeholder = "No hay entradas de tablas. Haga clic derecho y seleccione Actualizar campo."
+    elif lang == "english":
+        config.language = "en"
+        config.table_name = "Table"
+        config.figure_name = "Figure"
+        config.chapter_prefix = "Chapter "
+        config.appendix_prefix = "Appendix "
+        config.bib_title_default = "References"
+        config.toc_title = "TABLE OF CONTENTS"
+        config.lof_title = "LIST OF FIGURES"
+        config.lot_title = "LIST OF TABLES"
+        config.toc_placeholder = "Right-click and select Update Field to generate."
+        config.lof_placeholder = "No figure entries found. Right-click and select Update Field to generate."
+        config.lot_placeholder = "No table entries found. Right-click and select Update Field to generate."
+
+    # Override with explicit \figurename / \tablename
+    fig_name = _extract_simple_braced(preamble, "figurename")
+    if fig_name:
+        config.figure_name = strip_fmt(fig_name)
+    tab_name = _extract_simple_braced(preamble, "tablename")
+    if tab_name:
+        config.table_name = strip_fmt(tab_name)
+
+
+def parse_preamble(src: str, config: Config | None = None) -> dict:
     r"""
     Extract \newcommand definitions and \setcounter values.
-    Populates global MACROS dict.
+    Populates global MACROS dict and the provided Config object.
     Returns counters dict.
     """
+    if config is None:
+        config = CONFIG
+
     counters = {}
 
     # \setcounter{name}{value}
@@ -696,6 +904,11 @@ def parse_preamble(src: str) -> dict:
         counters[m.group(1)] = int(m.group(2))
 
     plazo = counters.get("PlazoTotal", 60)
+
+    # Document class and language drive defaults
+    docclass, opts = _detect_documentclass(src)
+    _apply_documentclass_to_config(docclass, opts, config)
+    _apply_language_to_config(src, config)
 
     # \newcommand{\Name}{Definition}  — single-level braces
     for m in re.finditer(
@@ -805,70 +1018,121 @@ def _parse_length(value: str):
     return None
 
 
-def parse_geometry(preamble: str) -> dict:
-    """Extract margin values from \\usepackage[...]{geometry} in the preamble."""
+def _find_executable(name: str, windows_hints: list[str] | None = None) -> str:
+    """Find an executable: first in PATH, then in common Windows locations."""
+    # 1. PATH
+    found = shutil.which(name)
+    if found:
+        return found
+
+    # 2. Common Windows locations
+    if sys.platform == "win32" and windows_hints:
+        for p in windows_hints:
+            if Path(p).exists():
+                return p
+
+    return name
+
+
+def parse_geometry(preamble: str, config: Config | None = None) -> dict:
+    """Extract margin values from \\usepackage[...]{geometry} and update config.
+
+    Returns the raw margins dict for backwards compatibility; the canonical
+    values are written directly into config.
+    """
+    if config is None:
+        config = CONFIG
+
     geom_m = re.search(r"\\usepackage\[(.*?)\]\{geometry\}", preamble, re.DOTALL)
-    if not geom_m:
-        return {}
-    opts = geom_m.group(1)
     margins = {}
-    for opt in re.split(r",\s*", opts):
-        if "=" not in opt:
-            continue
-        key, val = opt.split("=", 1)
-        key = key.strip().lower()
-        val = val.strip()
-        if key in ("left", "lmargin"):
-            margins["left"] = _parse_length(val)
-        elif key in ("right", "rmargin"):
-            margins["right"] = _parse_length(val)
-        elif key in ("top", "tmargin"):
-            margins["top"] = _parse_length(val)
-        elif key in ("bottom", "bmargin"):
-            margins["bottom"] = _parse_length(val)
-        elif key == "margin":
-            length = _parse_length(val)
-            if length is not None:
-                margins.setdefault("left", length)
-                margins.setdefault("right", length)
-                margins.setdefault("top", length)
-                margins.setdefault("bottom", length)
+    if geom_m:
+        opts = geom_m.group(1)
+        for opt in re.split(r",\s*", opts):
+            if "=" not in opt:
+                continue
+            key, val = opt.split("=", 1)
+            key = key.strip().lower()
+            val = val.strip()
+            if key in ("left", "lmargin"):
+                margins["left"] = _parse_length(val)
+            elif key in ("right", "rmargin"):
+                margins["right"] = _parse_length(val)
+            elif key in ("top", "tmargin"):
+                margins["top"] = _parse_length(val)
+            elif key in ("bottom", "bmargin"):
+                margins["bottom"] = _parse_length(val)
+            elif key == "margin":
+                length = _parse_length(val)
+                if length is not None:
+                    margins.setdefault("left", length)
+                    margins.setdefault("right", length)
+                    margins.setdefault("top", length)
+                    margins.setdefault("bottom", length)
+
+    # Apply to config, falling back to existing config defaults
+    config.margin_left   = margins.get("left",   config.margin_left)
+    config.margin_right  = margins.get("right",  config.margin_right)
+    config.margin_top    = margins.get("top",    config.margin_top)
+    config.margin_bottom = margins.get("bottom", config.margin_bottom)
+
+    # Calculate text body dimensions from page size and margins
+    def _to_inches(length):
+        if length is None:
+            return 0.0
+        if isinstance(length, Inches):
+            return length.inches
+        if isinstance(length, Cm):
+            return length.cm / 2.54
+        if isinstance(length, Mm):
+            return length.mm / 25.4
+        if isinstance(length, Pt):
+            return length.pt / 72.0
+        return 0.0
+
+    config.text_width_inches = (
+        config.page_width_inches
+        - _to_inches(config.margin_left)
+        - _to_inches(config.margin_right)
+    )
+    config.text_height_inches = (
+        config.page_height_inches
+        - _to_inches(config.margin_top)
+        - _to_inches(config.margin_bottom)
+    )
     return margins
 
 
-def setup_document(doc: Document, margins: dict = None):
-    """Page size (A4), margins, and base styles."""
-    sec = doc.sections[0]
-    sec.page_width    = Inches(8.27)
-    sec.page_height   = Inches(11.69)
-    if margins:
-        sec.top_margin    = margins.get("top", margins.get("tmargin", Cm(2.5)))
-        sec.bottom_margin = margins.get("bottom", margins.get("bmargin", Cm(2.0)))
-        sec.left_margin   = margins.get("left", margins.get("lmargin", Cm(2.54)))
-        sec.right_margin  = margins.get("right", margins.get("rmargin", Cm(2.54)))
-    else:
-        sec.top_margin    = Cm(2.5)
-        sec.bottom_margin = Cm(2.0)
-        sec.left_margin   = Cm(2.54)
-        sec.right_margin  = Cm(2.54)
+def setup_document(doc: Document, config: Config | None = None):
+    """Apply page size, margins, and base styles from config."""
+    if config is None:
+        config = CONFIG
 
-    doc.styles["Normal"].font.name = FONT
-    doc.styles["Normal"].font.size = Pt(PT_NORM)
+    sec = doc.sections[0]
+    sec.page_width    = Inches(config.page_width_inches)
+    sec.page_height   = Inches(config.page_height_inches)
+    sec.top_margin    = config.margin_top
+    sec.bottom_margin = config.margin_bottom
+    sec.left_margin   = config.margin_left
+    sec.right_margin  = config.margin_right
+
+    doc.styles["Normal"].font.name = config.font_name
+    doc.styles["Normal"].font.size = Pt(config.font_size_normal)
     doc.styles["Normal"].paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     doc.styles["Normal"].paragraph_format.space_before = Pt(0)
     doc.styles["Normal"].paragraph_format.space_after = Pt(0)
 
+    base = config.font_size_normal
     heading_cfg = {
-        "Heading 1": (14, True,  True),
-        "Heading 2": (13, True,  False),
-        "Heading 3": (12, True,  False),
-        "Heading 4": (11, False, True),
-        "Heading 5": (11, False, True),
+        "Heading 1": (base + 3, True,  True),
+        "Heading 2": (base + 2, True,  False),
+        "Heading 3": (base + 1, True,  False),
+        "Heading 4": (base,     False, True),
+        "Heading 5": (base,     False, True),
     }
     for name, (sz, bold, is_caps) in heading_cfg.items():
         try:
             s = doc.styles[name]
-            s.font.name  = FONT
+            s.font.name  = config.font_name
             s.font.size  = Pt(sz)
             s.font.bold  = bold
             s.font.color.rgb = C_BLACK
@@ -1428,25 +1692,14 @@ def compile_tikz_to_png(tikz_code: str, preamble: str, temp_dir: Path, fig_num: 
     tex_file = temp_dir / f"tikz_{fig_num:02d}.tex"
     tex_file.write_text(tex_content, encoding="utf-8")
 
-    # Buscar pdflatex
-    pdflatex = "pdflatex"
-    if sys.platform == "win32":
-        for p in [
-            r"C:\Program Files\MiKTeX\miktex\bin\x64\pdflatex.exe",
-            r"C:\ProgramData\MiKTeX\miktex\bin\x64\pdflatex.exe",
-            r"C:\Users\Alienware\AppData\Local\Programs\MiKTeX\miktex\bin\x64\pdflatex.exe",
-        ]:
-            if Path(p).exists():
-                pdflatex = p
-                break
-
+    pdflatex = CONFIG.pdflatex_path
     try:
         result = subprocess.run(
             [pdflatex, "-interaction=nonstopmode", str(tex_file.name)],
             cwd=str(temp_dir),
             capture_output=True,
             text=True,
-            timeout=90,
+            timeout=CONFIG.timeout_pdflatex,
         )
     except Exception as e:
         print(f"  [WARN] pdflatex falló para tikz {fig_num}: {e}")
@@ -1457,25 +1710,14 @@ def compile_tikz_to_png(tikz_code: str, preamble: str, temp_dir: Path, fig_num: 
         print(f"  [WARN] PDF no generado para tikz {fig_num}")
         return None
 
-    # Buscar pdftoppm
-    pdftoppm = "pdftoppm"
-    if sys.platform == "win32":
-        for p in [
-            r"C:\Program Files\MiKTeX\miktex\bin\x64\pdftoppm.exe",
-            r"C:\ProgramData\MiKTeX\miktex\bin\x64\pdftoppm.exe",
-            r"C:\Users\Alienware\AppData\Local\Programs\MiKTeX\miktex\bin\x64\pdftoppm.exe",
-        ]:
-            if Path(p).exists():
-                pdftoppm = p
-                break
-
+    pdftoppm = CONFIG.pdftoppm_path
     png_file = temp_dir / f"tikz_{fig_num:02d}.png"
     try:
         subprocess.run(
-            [pdftoppm, "-png", "-r", "300", "-singlefile", str(pdf_file), str(temp_dir / f"tikz_{fig_num:02d}")],
+            [pdftoppm, "-png", "-r", str(CONFIG.image_tikz_dpi), "-singlefile", str(pdf_file), str(temp_dir / f"tikz_{fig_num:02d}")],
             capture_output=True,
             check=False,
-            timeout=30,
+            timeout=CONFIG.timeout_pdftoppm,
         )
     except Exception as e:
         print(f"  [WARN] pdftoppm falló para tikz {fig_num}: {e}")
@@ -1619,6 +1861,27 @@ def resolve_image_path(img_name: str, base_dir: Path) -> Path | None:
     search_dirs = [base_dir] + [base_dir / p for p in GRAPHICSPATHS]
     for cand in candidates:
         for d in search_dirs:
+            p = d / cand
+            if p.exists():
+                return p
+    return None
+
+
+def _find_logo(base_dir: Path, config: Config | None = None) -> Path | None:
+    """Find a logo image, optionally using \\logo{...} from the preamble."""
+    if config is None:
+        config = CONFIG
+
+    # If the preamble defined \logo{...}, try that first
+    logo_cmd = _extract_simple_braced(PREAMBLE_GLOBAL, "logo")
+    if logo_cmd:
+        p = resolve_image_path(logo_cmd, base_dir)
+        if p:
+            return p
+
+    script_dir = Path(__file__).parent
+    for cand in config.logo_candidates:
+        for d in (base_dir, script_dir):
             p = d / cand
             if p.exists():
                 return p
@@ -2910,7 +3173,7 @@ def pre_scan_bibliography(text: str) -> tuple[dict, str | None, str, str]:
     # in the text before thebibliography
     prefix = text[max(0, m.start()-500):m.start()]
     title_m = re.search(r"\\renewcommand\{\\(?:refname|bibname)\}\{((?:[^{}]|\{[^{}]*\})*)\}", prefix)
-    bib_title = title_m.group(1) if title_m else "Referencias"
+    bib_title = title_m.group(1) if title_m else CONFIG.bib_title_default
 
     # Remove the \\renewcommand from text_without so it doesn't render as stray text
     if title_m:
@@ -2958,27 +3221,33 @@ def _render_bibliography(doc: Document, bib_inner: str, bib_map: dict):
         i += 2
 
 
-def _insert_list_of_figures(doc: Document, figures: list[tuple[int, str]]):
+def _insert_list_of_figures(doc: Document, figures: list[tuple[int, str]],
+                            config: Config | None = None):
     """Insert a real Word 'List of Figures' TOC field."""
+    if config is None:
+        config = CONFIG
     if not figures:
         return
     _insert_toc_field(
         doc,
         r'TOC \f F \h',
-        "ÍNDICE DE FIGURAS",
-        "No hay entradas de figuras. Haga clic derecho y seleccione Actualizar campo."
+        config.lof_title,
+        config.lof_placeholder
     )
 
 
-def _insert_list_of_tables(doc: Document, tables: list[tuple[int, str]]):
+def _insert_list_of_tables(doc: Document, tables: list[tuple[int, str]],
+                           config: Config | None = None):
     """Insert a real Word 'List of Tables' TOC field."""
+    if config is None:
+        config = CONFIG
     if not tables:
         return
     _insert_toc_field(
         doc,
         r'TOC \f T \h',
-        "ÍNDICE DE TABLAS",
-        "No hay entradas de tablas. Haga clic derecho y seleccione Actualizar campo."
+        config.lot_title,
+        config.lot_placeholder
     )
 
 
@@ -3117,7 +3386,7 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
             sec_counters["paragraph"] = 0
             htxt = strip_fmt(ch_m.group(2))
             num_str = format_section_number("chapter")
-            prefix = "Apéndice " if appendix_mode else "Capítulo "
+            prefix = CONFIG.appendix_prefix if appendix_mode else CONFIG.chapter_prefix
             full_title = f"{prefix}{num_str}  {htxt}"
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
@@ -3338,11 +3607,11 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                     except Exception:
                         pass
                     fig_clean = strip_fmt(fig_cap_txt).replace('"', "'")
-                    fig_caption = f"Figure {FIGURE_COUNTER[0]}: " + fig_clean
+                    fig_caption = f"{CONFIG.figure_name} {FIGURE_COUNTER[0]}: " + fig_clean
                     _run(cp, fig_caption,
                          italic=True, size=PT_SMALL, color=C_BLACK)
                     # Hidden TC field for List of Figures
-                    tc_text = f"Figura {FIGURE_COUNTER[0]}\t{fig_clean}"
+                    tc_text = f"{CONFIG.figure_name} {FIGURE_COUNTER[0]}\t{fig_clean}"
                     _add_tc_field(cp, tc_text, "F")
 
             elif env_name in ("equation", "equation*", "align", "align*", "gather", "gather*", "multline", "multline*", "eqnarray", "eqnarray*"):
@@ -3778,8 +4047,8 @@ def expand_inputs(source: str, base_dir: Path, root_dir: Path = None, depth: int
 
 
 def main():
-    global TEMP_DIR, PANDOC_PATH
-    
+    global TEMP_DIR, PANDOC_PATH, CONFIG, PREAMBLE_GLOBAL
+
     in_path  = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("linea_base_en.tex")
     if len(sys.argv) > 2:
         out_path = Path(sys.argv[2])
@@ -3796,43 +4065,52 @@ def main():
     # Crear carpeta temporal para archivos intermedios
     temp_dir = tempfile.mkdtemp(prefix="latex_conv_")
     TEMP_DIR = Path(temp_dir)
-    
+
+    # Fresh configuration for this run
+    CONFIG = Config()
+
     try:
         raw_source = in_path.read_text(encoding="utf-8")
         # Strip comments BEFORE expanding inputs, so commented-out \input / \IfFileExists are ignored
         source = re.sub(r"(?m)(?<!\\)%.*$", "", raw_source)
         source = expand_inputs(source, in_path.parent, root_dir=in_path.parent)
         print(f"[INFO] Inputs expandidos: {len(source)} caracteres")
-        
-        # Buscar pandoc
-        pandoc_exe = "pandoc"
-        if sys.platform == "win32":
-            pandoc_paths = [
-                r"C:\Program Files\Pandoc\pandoc.exe",
-                r"C:\ProgramData\chocolatey\bin\pandoc.exe",
-            ]
-            for pp in pandoc_paths:
-                if Path(pp).exists():
-                    pandoc_exe = pp
-                    break
-        PANDOC_PATH = pandoc_exe
 
         # 1. Extraer tablas a carpeta temporal
-        print("[1/3] Extrayendo tablas...")
+        print("[1/4] Extrayendo tablas...")
         n_tables = extract_tables_to_temp(source, TEMP_DIR)
         print(f"       {n_tables} tablas encontradas")
-        
-        # 2. Convertir tablas con Pandoc
-        if n_tables > 0:
-            print("[2/3] Convirtiendo tablas con Pandoc...")
-            convert_tables_with_pandoc(TEMP_DIR, pandoc_exe)
 
-        # 3. Parse preamble → populate MACROS
+        # 2. Parse preamble → populate MACROS and CONFIG
+        print("[2/4] Leyendo preámbulo...")
         preamble_end = source.find("\\begin{document}")
         preamble = source[:preamble_end] if preamble_end != -1 else source
-        parse_preamble(preamble)
-        geometry_margins = parse_geometry(preamble)
-        
+        PREAMBLE_GLOBAL = preamble
+        parse_preamble(preamble, CONFIG)
+        parse_geometry(preamble, CONFIG)
+
+        # 3. Find external tools
+        CONFIG.pandoc_path = _find_executable("pandoc", [
+            r"C:\Program Files\Pandoc\pandoc.exe",
+            r"C:\ProgramData\chocolatey\bin\pandoc.exe",
+        ])
+        CONFIG.pdflatex_path = _find_executable("pdflatex", [
+            r"C:\Program Files\MiKTeX\miktex\bin\x64\pdflatex.exe",
+            r"C:\ProgramData\MiKTeX\miktex\bin\x64\pdflatex.exe",
+            r"C:\Users\Alienware\AppData\Local\Programs\MiKTeX\miktex\bin\x64\pdflatex.exe",
+        ])
+        CONFIG.pdftoppm_path = _find_executable("pdftoppm", [
+            r"C:\Program Files\MiKTeX\miktex\bin\x64\pdftoppm.exe",
+            r"C:\ProgramData\MiKTeX\miktex\bin\x64\pdftoppm.exe",
+            r"C:\Users\Alienware\AppData\Local\Programs\MiKTeX\miktex\bin\x64\pdftoppm.exe",
+        ])
+        PANDOC_PATH = CONFIG.pandoc_path
+
+        # 4. Convertir tablas con Pandoc
+        if n_tables > 0:
+            print("[3/4] Convirtiendo tablas con Pandoc...")
+            convert_tables_with_pandoc(TEMP_DIR, CONFIG.pandoc_path)
+
         # Extract header text from \rhead{...}
         header_text = ""
         # Find all \rhead occurrences and pick the first one with actual text
@@ -3862,24 +4140,14 @@ def main():
         if header_text.strip().startswith('[') or 'icono' in header_text.lower():
             header_text = ""
 
-        # 4. Build document
-        print("[3/3] Generando documento Word...")
+        # 5. Build document
+        print("[4/4] Generando documento Word...")
         doc = Document()
-        setup_document(doc, geometry_margins)
+        setup_document(doc, CONFIG)
 
         # Buscar logo
-        script_dir = Path(__file__).parent
-        # Prefer the project's own icon/logo
-        logo_path = in_path.parent / "icono.png"
-        if not logo_path.exists():
-            logo_path = in_path.parent / "icono.jpg"
-        if not logo_path.exists():
-            logo_path = script_dir / "images" / "logo.jpg"
-        if not logo_path.exists():
-            logo_path = script_dir / "images" / "logo.png"
-        if not logo_path.exists():
-            logo_path = in_path.parent / "00_figs" / "logo.jpg"
-        add_header(doc, logo_path, header_text)
+        logo_path = _find_logo(in_path.parent, CONFIG)
+        add_header(doc, logo_path or Path("__missing_logo__"), header_text)
         add_footer(doc)
 
         parse_body(doc, source, in_path.parent)
@@ -3889,7 +4157,7 @@ def main():
 
         doc.save(str(out_path))
         print(f"[OK] Guardado: {out_path}")
-        
+
     finally:
         import shutil
         shutil.rmtree(temp_dir, ignore_errors=True)
