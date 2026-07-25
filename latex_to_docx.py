@@ -21,6 +21,7 @@ Usage:
 
 import re
 import sys
+import os
 import subprocess
 import shutil
 import tempfile
@@ -1147,7 +1148,9 @@ def setup_document(doc: Document, config: Config | None = None):
     doc.styles["Normal"].font.size = Pt(config.font_size_normal)
     doc.styles["Normal"].paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     doc.styles["Normal"].paragraph_format.space_before = Pt(0)
-    doc.styles["Normal"].paragraph_format.space_after = Pt(0)
+    # Keep a small gap after normal paragraphs so the document does not look
+    # completely packed (tables, lists and headings already add their own space).
+    doc.styles["Normal"].paragraph_format.space_after = Pt(6)
 
     base = config.font_size_normal
     heading_cfg = {
@@ -1392,6 +1395,32 @@ def _strip_column_spec(text: str):
     return "", text
 
 
+def _remove_at_expressions(col_spec: str) -> str:
+    r"""Remove all @{...} column separators from a LaTeX column spec.
+
+    Handles nested braces (e.g. @{ \hspace{0.5em} }) by using balanced-brace
+    extraction instead of a naive regex.
+    """
+    result: list[str] = []
+    pos = 0
+    while True:
+        idx = col_spec.find("@{", pos)
+        if idx == -1:
+            result.append(col_spec[pos:])
+            break
+        result.append(col_spec[pos:idx])
+        brace_start = idx + len("@{") - 1  # position of '{'
+        content = _extract_balanced_braces(col_spec, brace_start)
+        if content is None:
+            # Malformed @ expression; keep the marker and move on
+            result.append(col_spec[idx:idx + len("@{")])
+            pos = idx + len("@{")
+        else:
+            pos = brace_start + len(content) + 2
+    return "".join(result)
+
+
+
 
 
 def _flatten_single_cell_tabulars(content: str) -> str:
@@ -1460,6 +1489,7 @@ def _flatten_single_cell_tabulars(content: str) -> str:
             fmt_open = ""
             fmt_close = ""
             before = content[:start_env]
+            fmt_prefix_len = 0
             for cmd in fmt_cmds:
                 prefix = f"\\{cmd}{{"
                 if before.endswith(prefix):
@@ -1467,6 +1497,7 @@ def _flatten_single_cell_tabulars(content: str) -> str:
                     if closing < len(content) and content[closing] == "}":
                         fmt_open = prefix
                         fmt_close = "}"
+                        fmt_prefix_len = len(prefix)
                         break
 
             replacement = fmt_open + body.strip() + fmt_close
@@ -1477,7 +1508,10 @@ def _flatten_single_cell_tabulars(content: str) -> str:
                 pos = end_env + len("\\end{tabular}")
                 continue
 
-            result.append(content[pos:start_env])
+            # If the tabular was wrapped in \fmt{...}, drop that outer prefix from
+            # the literal text so we do not duplicate it (the replacement already
+            # includes it).
+            result.append(content[pos:start_env - fmt_prefix_len])
             result.append(replacement)
             pos = end_env + len("\\end{tabular}") + (1 if fmt_close else 0)
             changed = True
@@ -1520,7 +1554,7 @@ def _parse_col_widths_dxa(col_spec: str, n_cols: int,
     flex_indices = []
 
     # Extract individual column descriptors (ignore | and @{...})
-    col_spec_clean = re.sub(r"@\{[^}]*\}", "", col_spec)
+    col_spec_clean = _remove_at_expressions(col_spec)
     col_spec_clean = col_spec_clean.replace("|", "")
 
     tokens = re.findall(
@@ -1681,6 +1715,9 @@ def apply_booktabs_style(table):
                     run.font.color.rgb = C_BLACK
                     if run.font.size is None:
                         run.font.size = Pt(PT_SMALL)
+                    # La primera fila de una tabla booktabs es el header: negrilla
+                    if row_idx == 0:
+                        run.bold = True
 
 def normalize_text(text: str) -> str:
     """Normaliza texto para comparación (quita espacios extras, lowercase)."""
@@ -1825,6 +1862,120 @@ def is_continuation_row(row) -> bool:
     return is_continuation_row_cells(texts)
 
 
+def _merge_pandas_index_header(text: str) -> str:
+    r"""
+    Fusiona encabezados de DataFrame de pandas que vienen divididos en dos filas.
+
+    Patrón típico generado por pandas.to_latex(longtable=True):
+        & count & mean & std & ... \\
+        outfall &  &  &  & ... \\
+
+    El resultado es una sola fila:
+        outfall & count & mean & std & ... \\
+
+    También soporta el orden inverso. No modifica el texto si no detecta el
+    patrón, por lo que es seguro para tablas que no provengan de pandas.
+    """
+    lines = text.splitlines()
+    if len(lines) < 2:
+        return text
+
+    def _is_rule_line(s: str) -> bool:
+        return bool(re.match(r"^\s*\\(?:toprule|midrule|bottomrule|hline)\b", s))
+
+    def _data_cells(s: str):
+        s = s.rstrip("\\").strip()
+        if "&" not in s:
+            return None
+        cells = [c.strip() for c in s.split("&")]
+        # descartar celdas vacías al final
+        while cells and not cells[-1]:
+            cells.pop()
+        return cells
+
+    new_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Saltar líneas de rule o vacías tal cual
+        if _is_rule_line(line) or not line.strip():
+            new_lines.append(line)
+            i += 1
+            continue
+
+        cells = _data_cells(line)
+        if cells is None:
+            new_lines.append(line)
+            i += 1
+            continue
+
+        # Caso A: nombres de columnas en línea actual, nombre del índice en la siguiente
+        if (len(cells) >= 2 and not cells[0] and all(cells[1:]) and
+                i + 1 < len(lines)):
+            next_cells = _data_cells(lines[i + 1])
+            if next_cells and len(next_cells) >= 1 and next_cells[0] and not any(next_cells[1:]):
+                merged = next_cells[0] + " & " + " & ".join(cells[1:]) + " \\\\"
+                new_lines.append(merged)
+                i += 2
+                continue
+
+        # Caso B: nombre del índice en línea actual, nombres de columnas en la siguiente
+        if (len(cells) >= 1 and cells[0] and not any(cells[1:]) and
+                i + 1 < len(lines)):
+            next_cells = _data_cells(lines[i + 1])
+            if next_cells and len(next_cells) >= 2 and not next_cells[0] and all(next_cells[1:]):
+                merged = cells[0] + " & " + " & ".join(next_cells[1:]) + " \\\\"
+                new_lines.append(merged)
+                i += 2
+                continue
+
+        new_lines.append(line)
+        i += 1
+
+    return "\n".join(new_lines)
+
+
+def _merge_complementary_header_rows(rows_data: list[list[str]]) -> list[list[str]]:
+    """Merge the first two header rows when they look like a split header.
+
+    pandas/DataFrame tables often emit headers across two rows: names on the
+    first row and units or qualifiers on the second. If the first row already
+    looks like a header (mostly non-empty) and the second row adds extra text
+    in some columns, the two rows are merged into one with a space.
+    """
+    if len(rows_data) < 2:
+        return rows_data
+    first, second = rows_data[0], rows_data[1]
+    if len(first) != len(second):
+        return rows_data
+    if not any(b.strip() for b in second):
+        return rows_data
+    # The first row must look like a header: at least half of its cells
+    # should be non-empty. Otherwise these are probably data rows.
+    non_empty_first = sum(1 for a in first if a.strip())
+    if non_empty_first < len(first) / 2:
+        return rows_data
+    # The second row must look like a units/qualifier row: at least one empty
+    # cell. Fully-populated rows are treated as data, not header extensions.
+    if all(b.strip() for b in second):
+        return rows_data
+    # Avoid merging when the second row duplicates the first row's content
+    # (e.g. Pandoc occasionally emits an extra header row with repeated text).
+    # A genuine qualifier/units row adds *new* text in at least one non-empty
+    # cell.
+    second_texts = [b.strip() for b in second]
+    first_texts = [a.strip() for a in first]
+    adds_new_info = any(
+        b and b != a
+        for a, b in zip(first_texts, second_texts)
+    )
+    if not adds_new_info:
+        return rows_data
+    merged = [(a.strip() + " " + b.strip()).strip()
+              for a, b in zip(first, second)]
+    return [merged] + rows_data[2:]
+
+
 def compile_tikz_to_png(tikz_code: str, preamble: str, temp_dir: Path, fig_num: int):
     """
     Compila un bloque tikzpicture a PNG mediante pdflatex + pdftoppm.
@@ -1897,6 +2048,88 @@ def compile_tikz_to_png(tikz_code: str, preamble: str, temp_dir: Path, fig_num: 
             img.save(str(png_file))
     except Exception as e:
         print(f"  [WARN] No se pudo recortar tikz {fig_num}: {e}")
+
+    return png_file
+
+
+# Contador global para imágenes de ecuaciones matemáticas dentro de tablas array
+MATH_IMG_COUNTER = [0]
+
+
+def compile_math_to_png(math_code: str, temp_dir: Path) -> Path | None:
+    """
+    Compila una ecuación LaTeX a PNG mediante pdflatex + pdftoppm.
+    Usa el preámbulo global para que los macros personalizados estén disponibles.
+    Recorta el espacio en blanco sobrante con Pillow.
+    Devuelve la ruta del PNG o None si falla.
+    """
+    MATH_IMG_COUNTER[0] += 1
+    n = MATH_IMG_COUNTER[0]
+
+    tex_file = temp_dir / f"math_img_{n:04d}.tex"
+    pdf_file = temp_dir / f"math_img_{n:04d}.pdf"
+    png_file = temp_dir / f"math_img_{n:04d}.png"
+
+    clean_preamble = re.sub(r"\\documentclass\[.*?\]\{.*?\}\s*", "", PREAMBLE_GLOBAL, flags=re.DOTALL)
+    clean_preamble = re.sub(r"\\usepackage\[margin=[^\]]*\]\{geometry\}\s*", "", clean_preamble)
+
+    tex_content = (
+        r"\documentclass{article}" + "\n"
+        r"\usepackage[margin=0pt]{geometry}" + "\n"
+        r"\pagestyle{empty}" + "\n"
+        + clean_preamble + "\n"
+        r"\begin{document}" + "\n"
+        r"\[" + "\n"
+        + math_code + "\n"
+        r"\]" + "\n"
+        r"\end{document}" + "\n"
+    )
+    tex_file.write_text(tex_content, encoding="utf-8")
+
+    pdflatex = CONFIG.pdflatex_path
+    try:
+        subprocess.run(
+            [pdflatex, "-interaction=nonstopmode", str(tex_file.name)],
+            cwd=str(temp_dir),
+            capture_output=True,
+            text=True,
+            timeout=CONFIG.timeout_pdflatex,
+        )
+        # pdflatex puede devolver returncode != 0 por advertencias de paquetes
+        # (rerunfilecheck/bookmark) aunque el PDF se haya generado correctamente.
+        # Se verifica directamente la existencia y validez del PDF.
+        if not pdf_file.exists() or pdf_file.stat().st_size == 0:
+            return None
+    except Exception:
+        return None
+
+    pdftoppm = CONFIG.pdftoppm_path
+    try:
+        subprocess.run(
+            [pdftoppm, "-png", "-r", "300", "-singlefile", str(pdf_file), str(temp_dir / f"math_img_{n:04d}")],
+            capture_output=True,
+            check=False,
+            timeout=CONFIG.timeout_pdftoppm,
+        )
+    except Exception:
+        return None
+
+    if not png_file.exists():
+        return None
+
+    # Recortar espacio en blanco con Pillow
+    try:
+        from PIL import Image
+        img = Image.open(str(png_file))
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGB")
+        gray = img.convert("L")
+        bbox = gray.point(lambda x: 255 - x).getbbox()
+        if bbox:
+            img = img.crop(bbox)
+            img.save(str(png_file))
+    except Exception:
+        pass
 
     return png_file
 
@@ -2240,7 +2473,13 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
     table_num = TABLE_COUNTER[0]
     
     pandoc_table_file = TEMP_DIR / f'tabla_{table_num:02d}_pandoc.docx'
-    
+
+    # Las longtables no se renderizan bien con Pandoc (genera headers repetidos,
+    # filas de continuación y filas vacías residuales). Se fuerza el fallback manual.
+    longtable_source = TEMP_DIR / f'tabla_{table_num:02d}_longtable.tex'
+    if longtable_source.exists():
+        return False
+
     if not pandoc_table_file.exists():
         print(f'  [WARN] No se encuentra tabla Pandoc: {pandoc_table_file}')
         return False
@@ -2292,30 +2531,30 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
 
             valid_rows.append(row)
 
-        # Fusionar filas de header consecutivas que sean complementarias.
-        # Esto ocurre cuando un header de LaTeX ocupa varias filas y cada celda
-        # solo tiene texto en una de esas filas (ej. fila 1: nombres de columnas
-        # desde la columna 2; fila 2: nombre de la columna 1).
+        # Fusionar filas de header consecutivas que parezcan un header dividido.
+        # pandas/DataFrame tables often split headers across two rows: names on
+        # the first row and units/qualifiers on the second. Merge them into a
+        # single header row by concatenating the texts with a space.
         header_merged_texts: list[str] = []
         header_format_cells: list = []
         if valid_rows:
             merged = [cell.text.strip() for cell in valid_rows[0].cells]
             format_cells = list(valid_rows[0].cells)
-            i = 1
-            while i < len(valid_rows):
-                next_texts = [cell.text.strip() for cell in valid_rows[i].cells]
-                if len(next_texts) != len(merged):
-                    break
-                # Filas complementarias: en cada columna, al menos una celda está vacía.
-                if not all((not a or not b) for a, b in zip(merged, next_texts)):
-                    break
-                if not any(next_texts):
-                    break
-                for j, (a, b, cell) in enumerate(zip(merged, next_texts, valid_rows[i].cells)):
-                    if not a and b:
-                        format_cells[j] = cell
-                merged = [a or b for a, b in zip(merged, next_texts)]
-                valid_rows.pop(i)
+            # Only attempt to merge the very next row with the header.
+            if len(valid_rows) > 1:
+                next_texts = [cell.text.strip() for cell in valid_rows[1].cells]
+                if (len(next_texts) == len(merged) and
+                        any(next_texts) and
+                        not all(next_texts) and  # at least one empty cell -> likely units row
+                        sum(1 for a in merged if a) >= len(merged) / 2):
+                    # Do not merge if the second row only repeats cells from the
+                    # first row (Pandoc sometimes emits a spurious extra header).
+                    if any(b and b != a for a, b in zip(merged, next_texts)):
+                        for j, (a, b, cell) in enumerate(zip(merged, next_texts, valid_rows[1].cells)):
+                            if not a and b:
+                                format_cells[j] = cell
+                        merged = [(a + " " + b).strip() for a, b in zip(merged, next_texts)]
+                        valid_rows.pop(1)
             header_merged_texts = merged
             header_format_cells = format_cells
 
@@ -2400,21 +2639,33 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
                                         cloned = etree.fromstring(etree.tostring(child))
                                         new_para._p.append(cloned)
 
-                            # Copy runs one by one, preserving source formatting.
-                            # For merged header cells we replace the text while keeping
-                            # the format of the cell that originally held the content.
-                            for source_run in source_para.runs:
-                                run_text = header_text if (is_header_cell and source_run.text.strip()) else source_run.text
-                                if is_header_cell and not run_text:
-                                    continue
-                                new_run = new_para.add_run(run_text)
+                            if is_header_cell and header_text:
+                                # Merged header: write the merged text exactly once using
+                                # the formatting inferred from the source cell. Iterating
+                                # over every run and replacing its text would duplicate the
+                                # header when Pandoc split it across multiple runs.
+                                new_run = new_para.add_run(header_text)
                                 new_run.font.name = FONT
                                 new_run.font.size = Pt(font_size)
-                                new_run.bold = src_bold if is_header_cell else source_run.bold
-                                new_run.italic = src_italic if is_header_cell else source_run.italic
-                                run_color = src_color if is_header_cell else (source_run.font.color.rgb if source_run.font.color and source_run.font.color.rgb else None)
-                                if run_color:
-                                    new_run.font.color.rgb = run_color
+                                new_run.bold = src_bold
+                                new_run.italic = src_italic
+                                if src_color:
+                                    new_run.font.color.rgb = src_color
+                            else:
+                                # Copy runs one by one, preserving source formatting.
+                                for source_run in source_para.runs:
+                                    new_run = new_para.add_run(source_run.text)
+                                    new_run.font.name = FONT
+                                    new_run.font.size = Pt(font_size)
+                                    new_run.bold = source_run.bold
+                                    new_run.italic = source_run.italic
+                                    run_color = source_run.font.color.rgb if source_run.font.color and source_run.font.color.rgb else None
+                                    if run_color:
+                                        new_run.font.color.rgb = run_color
+
+                            # Scale OMML equations so they match the surrounding table
+                            # font size instead of Word's default (larger) equation size.
+                            _scale_omml_in_paragraph(new_para, font_size)
 
                         # If this is a merged header cell whose source was empty, make
                         # sure the merged text is written even though there were no runs.
@@ -2473,17 +2724,24 @@ def _scale_omml_in_paragraph(paragraph, pt_size: int):
 
     Pandoc renders inline/display math with the document's default equation
     size (11 pt). Inside table cells we want them to match the surrounding
-    table font, so we set <m:sz> on every math run property. The element is
-    cloned first so the OMML cache is not modified.
+    table font, so we set <m:sz> on every math run property and also add a
+    paragraph-level <w:sz> hint. The element is cloned first so the OMML cache
+    is not modified.
     """
     sz_val = str(int(pt_size * 2))  # half-points
     math_tags = (f"{{{MATH_NS}}}oMath", f"{{{MATH_NS}}}oMathPara")
+    has_math = False
 
     for child in list(paragraph._p):
         if child.tag not in math_tags:
             continue
+        has_math = True
         cloned = etree.fromstring(etree.tostring(child))
-        for r_pr in cloned.iter(qn("m:rPr")):
+        for m_r in cloned.iter(qn("m:r")):
+            r_pr = m_r.find(qn("m:rPr"))
+            if r_pr is None:
+                r_pr = OxmlElement("m:rPr")
+                m_r.insert(0, r_pr)
             sz = r_pr.find(qn("m:sz"))
             if sz is None:
                 sz = OxmlElement("m:sz")
@@ -2491,6 +2749,19 @@ def _scale_omml_in_paragraph(paragraph, pt_size: int):
             sz.set(qn("m:val"), sz_val)
         child.addnext(cloned)
         child.getparent().remove(child)
+
+    if has_math:
+        # Paragraph-level font size hint also helps Word scale the equation.
+        pPr = paragraph._p.get_or_add_pPr()
+        rPr = pPr.find(qn("w:rPr"))
+        if rPr is None:
+            rPr = OxmlElement("w:rPr")
+            pPr.insert(0, rPr)
+        sz = rPr.find(qn("w:sz"))
+        if sz is None:
+            sz = OxmlElement("w:sz")
+            rPr.append(sz)
+        sz.set(qn("w:val"), sz_val)
 
 
 def render_table(doc: Document, tab_inner: str, caption: str = "",
@@ -2627,6 +2898,10 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
         elif len(row) > ncols:
             rows_data[i] = row[:ncols]
 
+    # Merge two-row headers that are complementary (common in pandas/DataFrame
+    # tables where the first row holds names and the second row holds units).
+    rows_data = _merge_complementary_header_rows(rows_data)
+
     if not col_widths_dxa or len(col_widths_dxa) != ncols:
         col_widths_dxa = _parse_col_widths_dxa("", ncols)
 
@@ -2666,23 +2941,45 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
                     p = cell.add_paragraph()
                 p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER if (ri == header_row_idx) else WD_ALIGN_PARAGRAPH.LEFT
 
-                # En tablas array (\begin{array} en modo math), envolver cada
-                # celda en $...$ para que Pandoc la convierta a OMML, salvo que
-                # ya contenga math inline o sea solo texto (\text{...}).
-                if is_array and "$" not in line and not _is_plain_text_cell(line):
-                    line = f"${line}$"
-
                 # Sanitize any stray marker characters that leaked through
                 line = line.replace("\x00SJ\x00", "\\\\").replace("\x00NL\x00", "\\\\")
 
-                # Parse inline formatting respecting LaTeX commands (bold, italic,
-                # math). For arrays, plain-text cells stay as normal text so they
-                # match the table font size instead of becoming large OMML.
-                parse_inline(p, line, base_sz=PT_SMALL)
+                # En tablas array (\begin{array} en modo math), las celdas con
+                # ecuaciones se renderizan como imágenes PNG para que Word no las
+                # muestre con el tamaño grande por defecto de OMML. Las celdas de
+                # texto plano siguen como texto normal.
+                use_image = False
+                if is_array and "$" not in line and not _is_plain_text_cell(line):
+                    use_image = True
+                    # Calcular ancho máximo razonable para la imagen en esta celda
+                    if col_widths_dxa and ci < len(col_widths_dxa):
+                        max_img_width = col_widths_dxa[ci] / 1440.0
+                    else:
+                        max_img_width = max(TEXT_WIDTH_INCHES / max(ncols, 1) * 0.9, 0.5)
+                    # Limpiar párrafo
+                    for run in list(p.runs):
+                        run._element.getparent().remove(run._element)
+                    p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    png_path = compile_math_to_png(line, TEMP_DIR)
+                    if png_path and png_path.exists():
+                        if not _insert_image_with_size(p, png_path, max_width_inches=max_img_width, dpi=300.0):
+                            use_image = False
+                    else:
+                        use_image = False
 
-                # Inside array tables, scale down equations so they match the
-                # surrounding table font instead of using Word's default 11 pt.
-                if is_array:
+                if not use_image:
+                    # Parse inline formatting respecting LaTeX commands (bold, italic,
+                    # math). For arrays, plain-text cells stay as normal text so they
+                    # match the table font size instead of becoming large OMML.
+                    # Si falló la generación de imagen para una celda de array con
+                    # math real, reintroducimos los delimitadores $...$ para que
+                    # parse_inline genere OMML en lugar de texto plano raro.
+                    parse_line = line
+                    if is_array and not _is_plain_text_cell(line) and "$" not in line:
+                        parse_line = f"${line}$"
+                    parse_inline(p, parse_line, base_sz=PT_SMALL)
+                    # Scale OMML equations so they match the surrounding table
+                    # font size instead of Word's default (larger) equation size.
                     _scale_omml_in_paragraph(p, PT_SMALL)
 
     apply_booktabs_style(table)
@@ -3722,6 +4019,8 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                         # remove \resizebox wrapper
                         tab_inner = re.sub(r"\\resizebox\{[^}]*\}\{[^}]*\}\{?\s*", "", tab_inner)
                         tab_inner = re.sub(r"\s*\}?\s*$", "", tab_inner)
+                        # Fusionar encabezados divididos de pandas (índice con nombre)
+                        tab_inner = _merge_pandas_index_header(tab_inner)
                         render_table(doc, tab_inner, caption, col_spec=col_spec)
                         rendered = True
                         break
@@ -3736,6 +4035,8 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
             elif env_name == "longtable":
                 cap_txt = _extract_caption_content(inner)
                 caption = cap_txt if cap_txt is not None else ""
+                # Fusionar encabezados divididos de pandas antes de cualquier otro procesamiento
+                inner = _merge_pandas_index_header(inner)
                 # strip column spec
                 col_spec, inner = _strip_column_spec(inner)
                 # strip \endfirsthead...\endhead  and  \endfoot...\endlastfoot
@@ -3761,6 +4062,8 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 # remove \resizebox wrapper
                 inner = re.sub(r"\\resizebox\{[^}]*\}\{[^}]*\}\{?\s*", "", inner)
                 inner = re.sub(r"\s*\}?\s*$", "", inner)
+                # Fusionar encabezados divididos de pandas (índice con nombre)
+                inner = _merge_pandas_index_header(inner)
                 render_table(doc, inner, caption="", col_spec=col_spec)
 
             elif env_name == "center":
@@ -4099,6 +4402,8 @@ def _add_para(doc: Document, raw: str, init_bold=False, init_italic=False, init_
         )
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        p.paragraph_format.space_after = Pt(12)
+        p.paragraph_format.space_before = Pt(0)
         parse_inline(p, para_text, base_sz=PT_NORM,
                      bold=cur_bold, italic=cur_italic, size=cur_size)
         _maybe_add_tab_stop(p, para_text)
@@ -4200,12 +4505,15 @@ def extract_tables_to_temp(source: str, temp_dir: Path) -> int:
         # antes de delegar la conversión a Pandoc.
         col_spec, rest = _strip_column_spec(content)
         if col_spec:
-            clean_spec = re.sub(r"@\{[^}]*\}", "", col_spec)
+            clean_spec = _remove_at_expressions(col_spec)
             content = "{" + clean_spec + "}" + rest
 
         # Aplanar tabulares anidados de una sola celda (ej. encabezados centrados
         # con \begin{tabular}[c]{@{}c@{}}texto\end{tabular}).
         content = _flatten_single_cell_tabulars(content)
+
+        # Fusionar encabezados divididos generados por pandas (índice con nombre).
+        content = _merge_pandas_index_header(content)
 
         # Los entornos array se renderizan manualmente en _walk (is_array=True),
         # pero necesitamos un archivo Pandoc "placeholder" para mantener el
@@ -4412,7 +4720,10 @@ def main():
 
     finally:
         import shutil
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        if not os.environ.get("KEEP_LATEX_CONV_TEMP"):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        else:
+            print(f"[INFO] Temp dir preservado: {temp_dir}")
 
 
 if __name__ == "__main__":
