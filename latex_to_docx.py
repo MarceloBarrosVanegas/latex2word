@@ -2990,6 +2990,21 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
 # List renderer
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _add_paragraph_safe(doc: Document, style: str | None = None):
+    """Add a paragraph, falling back to no style if the requested style is missing.
+
+    Reference/template documents may not contain every built-in style (e.g.
+    ``List Bullet``), so we catch the KeyError and create a plain paragraph.
+    """
+    try:
+        return doc.add_paragraph(style=style)
+    except KeyError:
+        p = doc.add_paragraph()
+        if style:
+            print(f"  [WARN] Estilo '{style}' no encontrado en la plantilla; usando párrafo normal")
+        return p
+
+
 def _get_list_number_abstract_num_id(doc: Document):
     """Find the abstractNumId used by the 'List Number' style in this document."""
     try:
@@ -3161,7 +3176,7 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
                         p = doc.add_paragraph(style="Normal")
                         p.paragraph_format.left_indent = Inches(0.5 * (depth + 1))
                     else:
-                        p = doc.add_paragraph(style=para_style)
+                        p = _add_paragraph_safe(doc, para_style)
                         if has_custom_label:
                             if is_enumitem_label:
                                 p.paragraph_format.left_indent = Inches(0.5 * (depth + 1))
@@ -3192,7 +3207,7 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
             size_map = {2: 14, 3: 13, 4: 12, 5: 11}
             level = level_map.get(cmd, 4)
             style_name = f"Heading {level}"
-            p = doc.add_paragraph(style=style_name)
+            p = _add_paragraph_safe(doc, style_name)
             run = p.add_run(strip_fmt(title))
             run.font.name = FONT
             run.font.size = Pt(size_map.get(level, 12))
@@ -3976,7 +3991,7 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
             # Create heading with number - use explicit style for TOC recognition
             full_title = f"{num_str}  {htxt}".strip()
             style_name = f"Heading {level}"
-            p = doc.add_paragraph(style=style_name)
+            p = _add_paragraph_safe(doc, style_name)
             run = p.add_run(full_title)
             run.font.name = FONT
             run.font.size = Pt(sizes[level-1])
@@ -4618,6 +4633,16 @@ def main():
     if not out_path.is_absolute():
         out_path = in_path.parent / out_path
 
+    # Optional third argument: path to a reference/template .docx whose styles,
+    # page setup, header and footer should be preserved.
+    template_path = None
+    if len(sys.argv) > 3:
+        candidate = Path(sys.argv[3])
+        if candidate.exists():
+            template_path = candidate
+        else:
+            print(f"[WARN] Plantilla no encontrada: {candidate}; se usará documento vacío.")
+
     if not in_path.exists():
         print(f"Error: file not found: {in_path}", file=sys.stderr)
         sys.exit(1)
@@ -4702,13 +4727,19 @@ def main():
 
         # 5. Build document
         print("[4/4] Generando documento Word...")
-        doc = Document()
-        setup_document(doc, CONFIG)
+        if template_path:
+            print(f"       Usando plantilla: {template_path}")
+            doc = Document(str(template_path))
+            # When a template is provided we keep its styles, page setup and
+            # header/footer. We still honour the LaTeX language for captions.
+        else:
+            doc = Document()
+            setup_document(doc, CONFIG)
 
-        # Buscar logo
-        logo_path = _find_logo(in_path.parent, CONFIG)
-        add_header(doc, logo_path or Path("__missing_logo__"), header_text)
-        add_footer(doc)
+            # Buscar logo
+            logo_path = _find_logo(in_path.parent, CONFIG)
+            add_header(doc, logo_path or Path("__missing_logo__"), header_text)
+            add_footer(doc)
 
         parse_body(doc, source, in_path.parent)
 
