@@ -16,7 +16,7 @@ REQUISITOS PREVIOS:
 PRIMERA VEZ - CONFIGURAR EL ENTORNO:
 ────────────────────────────────────
 1. Haz doble clic en "00_setup_entorno.bat"
-   Esto crea un entorno virtual e instala las bibliotecas necesarias:
+   Esto crea o repara el entorno local .venv en este equipo e instala:
       - python-docx
       - lxml
       - Pillow
@@ -38,8 +38,21 @@ COMO USAR:
    (usa este archivo, NO el anterior, para que todo corra dentro
    del entorno virtual configurado).
 
-4. El archivo Word se guarda en esta misma carpeta:
-      latex_to_word_converter\
+4. El archivo Word se guarda junto al archivo .tex de entrada.
+   TEMPLATE_PATH es opcional: si se configura una plantilla, se conservan
+   sus estilos, margenes, encabezado y pie. Dejala en blanco para usar
+   el formato y las imagenes declarados en el LaTeX.
+
+   El entorno .venv debe configurarse en cada equipo; no reutilices
+   un entorno copiado de otro usuario. No se incluye en nuevos commits.
+
+   El indice de contenidos solo se genera si el LaTeX contiene
+   \tableofcontents. Las macros \newcommand admiten argumentos entre
+   llaves y un primer argumento opcional, conservando el formato.
+
+   Tambien puedes pasar entrada, salida y plantilla como argumentos
+   a 00_convertir_con_entorno.bat. El tercer argumento "-" omite
+   la plantilla configurada y usa el formato del LaTeX.
 
 ═══════════════════════════════════════════════════════════════
 
@@ -68,7 +81,7 @@ Metodo manual:
 ARCHIVOS GENERADOS:
 ───────────────────
 - linea_base_en.docx (o el nombre que configuraste)
-- Se guarda en: latex_to_word_converter\
+- Se guarda junto al archivo .tex configurado.
 
 ═══════════════════════════════════════════════════════════════
 

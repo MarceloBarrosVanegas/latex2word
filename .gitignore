@@ -1,4 +1,6 @@
 __pycache__/
+.venv/
+venv/
 *.pyc
 *.pyo
 *.docx
@@ -9,3 +11,4 @@ expanded_debug.tex
 *.out
 *.toc
 *.tmp
+*.bak

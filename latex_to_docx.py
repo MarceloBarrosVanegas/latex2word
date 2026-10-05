@@ -49,9 +49,11 @@ class Config:
     """Runtime configuration populated from the LaTeX preamble and CLI defaults."""
     # Presentation
     font_name: str = "Calibri"
-    font_size_normal: int = 11
+    font_size_normal: float = 11
     font_size_small: int = 9
     font_size_foot: int = 8
+    paragraph_space_after: float = 12
+    line_spacing: float | Pt | None = None
 
     # Page
     page_width_inches: float = 8.27
@@ -151,6 +153,12 @@ OMML_CACHE: dict[str, object] = {}
 TEXT_WIDTH_INCHES  = 6.27
 # Alto aproximado del cuerpo de texto (A4, margin ~1in arriba/abajo → 11.69 - 2 ≈ 9.5in)
 TEXT_HEIGHT_INCHES = 9.50
+# Factor para longitudes de "espacio restante" (ej. \espacioRestante =
+# \textheight - \pagetotal - ...). En el PDF la figura nunca dispone de toda
+# la altura de texto porque el encabezado de sección y el texto previo ya
+# ocuparon parte de la página; sin este factor las imágenes quedan más altas
+# que en LaTeX y la figura se parte entre páginas.
+REMAINING_SPACE_FACTOR = 0.8
 
 # ─────────────────────────────────────────────────────────────────────────────
 # XML helpers
@@ -500,15 +508,43 @@ def _run(para, text: str, bold=False, italic=False,
 
 # Populated during preamble parsing
 MACROS: dict[str, str] = {}
+MACRO_ARGS: dict[str, tuple[int, str | None, str]] = {}
+TEMPLATE_PATH: Path | None = None
 
 
 def _resolve_macros(text: str) -> str:
-    """Replace custom commands with their resolved text.
-    Sort by key length descending so \\PrestadorII replaces before \\PrestadorI.
-    """
-    for k in sorted(MACROS.keys(), key=len, reverse=True):
-        text = text.replace(k, MACROS[k])
-    return text
+    r"""Expand document macros without discarding formatting or arguments."""
+    # ponytail: bounded expansion, not a TeX interpreter; reject recursive macros.
+    for _ in range(20):
+        previous = text
+        for key in sorted(MACROS, key=len, reverse=True):
+            boundary = r"(?![A-Za-z@])" if key[-1].isalpha() else ""
+            text = re.sub(re.escape(key) + boundary, lambda m: MACROS[key], text)
+        for match in reversed(list(re.finditer(r"\\[A-Za-z@]+", text))):
+            definition = MACRO_ARGS.get(match.group())
+            if definition is None:
+                continue
+            count, default, body = definition
+            rest = text[match.end():].lstrip()
+            args = []
+            if default is not None:
+                optional, rest = _extract_optional_arg(rest)
+                args.append(default if optional is None else optional)
+            for _ in range(count - len(args)):
+                arg = _extract_balanced_braces(rest, 0)
+                if arg is None:
+                    raise ValueError(f"Falta un argumento entre llaves para {match.group()}")
+                args.append(arg)
+                rest = rest[len(arg) + 2:].lstrip()
+            replacement = re.sub(r"#([1-9])", lambda m: args[int(m.group(1)) - 1], body)
+            end = len(text) - len(rest)
+            text = text[:match.start()] + replacement + " " + text[end:]
+        if text == previous:
+            if any(m.group() in MACROS or m.group() in MACRO_ARGS
+                   for m in re.finditer(r"\\[A-Za-z@]+", text)):
+                raise ValueError("Definición recursiva de una macro.")
+            return text
+    raise ValueError("Las macros no terminan de expandirse; revise definiciones recursivas.")
 
 
 def _clean(text: str) -> str:
@@ -521,7 +557,8 @@ def _clean(text: str) -> str:
     # (\bfseries, \normalfont) are now handled by parse_inline so they can
     # affect formatting. They are no longer stripped here.
     # Remove \centering to avoid \c being treated as cedilla during accent processing.
-    text = re.sub(r"\\centering\b", " ", text)
+    text = re.sub(r"\\centering\b|\\[vh]space\*?\{[^}]*\}",
+                  lambda m: " " if m.group() == r"\centering" else "\t", text)
     # Convert LaTeX accent commands to Unicode (\'{a}, \'a, \~{n}, \^u, etc.)
     # MUST happen before replacing standalone ~ with non-breaking space
     def _accent_repl(m):
@@ -545,6 +582,7 @@ def _clean(text: str) -> str:
     text = text.replace("\\&", "&")
     text = text.replace("\\_", "_")
     text = text.replace("\\#", "#")
+    text = text.replace("``", "“").replace("''", "”")
     text = text.replace("\\,", "\u202f")           # narrow no-break space
     text = re.sub(r"\\hspace\*?\{[^}]*\}", "\t", text)  # replace \hspace{...} with tab
     text = re.sub(r"\\vspace\*?\{[^}]*\}", "\t", text)  # replace \vspace{...} with tab
@@ -869,7 +907,7 @@ def _apply_documentclass_to_config(docclass: str, opts: list[str], config: Confi
 def _apply_language_to_config(preamble: str, config: Config):
     """Detect babel/polyglossia language and set captions accordingly."""
     lang = None
-    m = re.search(r"\\usepackage\[(.*?)\]\{babel\}", preamble, re.DOTALL)
+    m = re.search(r"\\usepackage\[([^\]]*)\]\{babel\}", preamble)
     if m:
         opts = [o.strip().lower() for o in m.group(1).split(",")]
         for o in opts:
@@ -927,6 +965,8 @@ def parse_preamble(src: str, config: Config | None = None) -> dict:
         config = CONFIG
 
     counters = {}
+    MACROS.clear()
+    MACRO_ARGS.clear()
 
     # \setcounter{name}{value}
     for m in re.finditer(r"\\setcounter\{(\w+)\}\{(\d+)\}", src):
@@ -939,18 +979,34 @@ def parse_preamble(src: str, config: Config | None = None) -> dict:
     _apply_documentclass_to_config(docclass, opts, config)
     _apply_language_to_config(src, config)
 
-    # \newcommand{\Name}{Definition}  — single-level braces
-    for m in re.finditer(
-        r"\\newcommand\{(\\[A-Za-z]+)\}\{((?:[^{}]|\{[^{}]*\})*)\}",
-        src
-    ):
-        cmd, dfn = m.group(1), m.group(2)
-        MACROS[cmd + "{}"] = dfn
-        MACROS[cmd]        = dfn
+    # Balanced definitions: nested braces, mandatory arguments and optional defaults.
+    position = 0
+    command = re.compile(r"\\(?:newcommand|renewcommand|providecommand)\*?\s*(?:\{\s*(\\[A-Za-z@]+)\s*\}|(\\[A-Za-z@]+))")
+    while match := command.search(src, position):
+        cmd = match.group(1) or match.group(2)
+        rest = src[match.end():].lstrip()
+        count_text, rest = _extract_optional_arg(rest)
+        count = int(count_text) if count_text is not None else 0
+        if not 0 <= count <= 9:
+            raise ValueError(f"Número de argumentos no válido para {cmd}: {count}")
+        default, rest = _extract_optional_arg(rest) if count else (None, rest)
+        definition = _extract_balanced_braces(rest, 0)
+        if definition is None:
+            raise ValueError(f"Definición incompleta de {cmd}")
+        position = len(src) - len(rest) + len(definition) + 2
+        if match.group().startswith(r"\providecommand") and (cmd in MACROS or cmd in MACRO_ARGS):
+            continue
+        MACROS.pop(cmd, None)
+        MACROS.pop(cmd + "{}", None)
+        MACRO_ARGS.pop(cmd, None)
+        if count:
+            MACRO_ARGS[cmd] = (count, default, definition)
+        else:
+            MACROS[cmd + "{}"] = definition
+            MACROS[cmd] = definition
 
     # \newglossaryentry{key}{name={name},description={...}}  -> macros \gls{key} and \Gls{key}
     pos = 0
-    gls_keys = set()
     while True:
         idx = src.find("\\newglossaryentry{", pos)
         if idx == -1:
@@ -975,11 +1031,9 @@ def parse_preamble(src: str, config: Config | None = None) -> dict:
                 name = _extract_balanced_braces(block, name_start)
                 if name is not None:
                     MACROS[f"\\gls{{{key}}}"] = name
-                    gls_keys.add(f"\\gls{{{key}}}")
                     if name:
                         cap_name = name[0].upper() + name[1:]
                         MACROS[f"\\Gls{{{key}}}"] = cap_name
-                        gls_keys.add(f"\\Gls{{{key}}}")
         pos = block_start + len(block) + 2
 
     # Month / Year / generic placeholders
@@ -1006,17 +1060,25 @@ def parse_preamble(src: str, config: Config | None = None) -> dict:
         MACROS[k]       = v
         MACROS[k + "{}"] = v
 
-    # Recursively resolve nested macro refs (one pass)
-    for key in list(MACROS.keys()):
-        for k2, v2 in list(MACROS.items()):
-            MACROS[key] = MACROS[key].replace(k2, v2)
-
-    # Strip remaining LaTeX from macro values (preserve glossary names so $math$ stays intact)
-    for key in list(MACROS.keys()):
-        if key not in gls_keys:
-            MACROS[key] = strip_fmt(MACROS[key])
-
     return counters
+
+
+def parse_text_settings(source: str, config: Config):
+    """Read document-wide typography, including initial body font selection."""
+    preamble, _, body = source.partition(r"\begin{document}")
+    if r"{helvet}" in preamble and r"\sfdefault" in preamble:
+        config.font_name = "Arial"
+    spacing = re.search(r"\\setlength\s*\{\\parskip\}\s*\{([\d.]+)pt\}", preamble)
+    if spacing:
+        config.paragraph_space_after = float(spacing.group(1))
+    leading = re.match(r"\s*\\fontsize\s*\{([\d.]+)\}\s*\{([\d.]+)\}\s*\\selectfont", body)
+    if leading:
+        config.font_size_normal = float(leading.group(1))
+        config.line_spacing = Pt(float(leading.group(2)))
+    else:
+        spread = re.search(r"\\linespread\{([\d.]+)\}", preamble)
+        if spread:
+            config.line_spacing = float(spread.group(1))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1150,7 +1212,8 @@ def setup_document(doc: Document, config: Config | None = None):
     doc.styles["Normal"].paragraph_format.space_before = Pt(0)
     # Keep a small gap after normal paragraphs so the document does not look
     # completely packed (tables, lists and headings already add their own space).
-    doc.styles["Normal"].paragraph_format.space_after = Pt(6)
+    doc.styles["Normal"].paragraph_format.space_after = Pt(config.paragraph_space_after)
+    doc.styles["Normal"].paragraph_format.line_spacing = config.line_spacing
 
     base = config.font_size_normal
     heading_cfg = {
@@ -1240,6 +1303,90 @@ def add_footer(doc: Document):
 # Title page
 # ─────────────────────────────────────────────────────────────────────────────
 
+def add_latex_header_footer(doc: Document, preamble: str, base_dir: Path) -> bool:
+    """Render explicit fancyhdr content and a lower-left page background."""
+    boxes = {"head": {}, "foot": {}}
+    for match in re.finditer(r"\\fancy(head|foot)(?:\[([^\]]*)\])?\s*\{", preamble):
+        content = _extract_balanced_braces(preamble, match.end() - 1)
+        if content is not None:
+            for side in (match.group(2) or "C"):
+                if side in "LCR":
+                    boxes[match.group(1)][side] = content
+    if not any(boxes.values()):
+        return False
+    section = doc.sections[0]
+    for region, part in (("head", section.header), ("foot", section.footer)):
+        for child in list(part._element):
+            part._element.remove(child)
+        table = part.add_table(rows=1, cols=3, width=Inches(TEXT_WIDTH_INCHES))
+        table.autofit = False
+        for index, fraction in enumerate((0.45, 0.10, 0.45)):
+            table.columns[index].width = Inches(TEXT_WIDTH_INCHES * fraction)
+            cell = table.cell(0, index)
+            cell.width = table.columns[index].width
+            content = boxes[region].get("LCR"[index], "")
+            content = re.sub(r"\\raisebox\{[^}]*\}\{([^{}]*)\}", r"\1", content)
+            image_pattern = re.compile(r"\\includegraphics(?:\[([^\]]*)\])?\{([^}]*)\}")
+            for line_index, line in enumerate(re.split(r"\\\\", content)):
+                paragraph = cell.paragraphs[0] if line_index == 0 else cell.add_paragraph()
+                paragraph.alignment = (WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.CENTER,
+                                       WD_ALIGN_PARAGRAPH.RIGHT)[index]
+                paragraph.paragraph_format.space_after = Pt(0)
+                paragraph.paragraph_format.line_spacing = 1.0
+                for chunk in re.split(r"(\\thepage)", image_pattern.sub("", line)):
+                    if chunk == r"\thepage":
+                        _add_page_number_field(paragraph.add_run())
+                    else:
+                        parse_inline(paragraph, chunk, base_sz=PT_SMALL)
+                for image in image_pattern.finditer(line):
+                    path = resolve_image_path(image.group(2), base_dir)
+                    if path is None:
+                        raise ValueError(f"No se encuentra la imagen del encabezado/pie: {image.group(2)}")
+                    width, height = _parse_graphics_size(image.group(1) or "", path)
+                    paragraph.add_run().add_picture(str(path), width=Inches(width or 1),
+                                                    height=Inches(height) if height else None)
+        part.add_paragraph().paragraph_format.space_after = Pt(0)
+    geometry = re.search(r"\\usepackage\[([^\]]*)\]\{geometry\}", preamble)
+    options = geometry.group(1) if geometry else ""
+    lengths = dict(re.findall(r"(headheight|headsep)\s*=\s*([\d.]+(?:mm|cm|pt|in))", options))
+    if "headheight" in lengths:
+        section.header_distance = max(0, section.top_margin - _parse_length(lengths["headheight"])
+                                      - (_parse_length(lengths.get("headsep", "0pt")) or 0))
+    raises = [_parse_length(value) for content in boxes["foot"].values()
+              for value in re.findall(r"\\raisebox\{([\d.]+(?:mm|cm|pt|in))\}", content)]
+    if raises:
+        section.footer_distance += max(raises)
+    background = _extract_simple_braced(preamble, "AddToShipoutPictureBG") or ""
+    image = re.search(r"\\includegraphics(?:\[([^\]]*)\])?\{([^}]*)\}", background)
+    if image and r"\AtPageLowerLeft" in background:
+        path = resolve_image_path(image.group(2), base_dir)
+        if path is None:
+            raise ValueError(f"No se encuentra la imagen de fondo: {image.group(2)}")
+        options = (image.group(1) or "").replace(r"\paperwidth", f"{section.page_width.inches}in")
+        width, height = _parse_graphics_size(options, path)
+        paragraph = section.footer.paragraphs[-1]
+        picture = paragraph.add_run().add_picture(str(path), width=Inches(width or section.page_width.inches),
+                                                  height=Inches(height) if height else None)
+        anchor = picture._inline
+        anchor.tag = qn("wp:anchor")
+        for name, value in {"simplePos": "0", "relativeHeight": "0", "behindDoc": "1",
+                            "locked": "0", "layoutInCell": "1", "allowOverlap": "1"}.items():
+            anchor.set(name, value)
+        position = OxmlElement("wp:simplePos")
+        position.set("x", "0")
+        position.set("y", "0")
+        anchor.insert(0, position)
+        for index, (axis, offset) in enumerate((("H", 0), ("V", section.page_height - picture.height)), 1):
+            position = OxmlElement(f"wp:position{axis}")
+            position.set("relativeFrom", "page")
+            value = OxmlElement("wp:posOffset")
+            value.text = str(offset)
+            position.append(value)
+            anchor.insert(index, position)
+        anchor.find(qn("wp:docPr")).addprevious(OxmlElement("wp:wrapNone"))
+    return True
+
+
 def add_title_page(doc: Document, title_img_path: Path | None,
                    title_img_width: float | None, title_img_height: float | None,
                    title: str, author: str, date_str: str):
@@ -1289,6 +1436,9 @@ def _extract_balanced_braces(text: str, start: int):
     depth = 1
     i = start + 1
     while i < len(text) and depth > 0:
+        if text[i] == "\\":
+            i += 2
+            continue
         if text[i] == "{":
             depth += 1
         elif text[i] == "}":
@@ -1522,6 +1672,29 @@ def _flatten_single_cell_tabulars(content: str) -> str:
     return content
 
 
+def _expand_shortstack(text: str) -> str:
+    r"""Replace \shortstack{...} with its lines joined by a single space.
+
+    Pandoc does not understand \shortstack and shreds the header into
+    misaligned rows, losing the first line of each stacked cell. Joining the
+    lines keeps the full header text inside a single cell. Handles nested
+    braces (e.g. \shortstack{densidad\\{saturación}}) and the optional
+    alignment argument (e.g. \shortstack[l]{...}).
+    """
+    pattern = re.compile(r"\\shortstack(?:\[[^\]]*\])?\{")
+    # Process from the last match backwards so positions stay valid
+    for m in reversed(list(pattern.finditer(text))):
+        brace_start = m.end() - 1
+        body = _extract_balanced_braces(text, brace_start)
+        if body is None:
+            continue
+        lines = [ln.strip() for ln in re.split(r"\\\\", body) if ln.strip()]
+        replacement = " ".join(lines)
+        end = brace_start + len(body) + 2  # +2 for the surrounding braces
+        text = text[:m.start()] + replacement + text[end:]
+    return text
+
+
 def _is_plain_text_cell(line: str) -> bool:
     """Return True if a cell only contains text formatting commands.
 
@@ -1550,30 +1723,21 @@ def _parse_col_widths_dxa(col_spec: str, n_cols: int,
     Handles p{frac\\textwidth}, X, l, r, c.
     Unknown/flexible columns share the remaining width equally.
     """
-    fixed_fracs = []   # (index, fraction)
-    flex_indices = []
-
     # Extract individual column descriptors (ignore | and @{...})
     col_spec_clean = _remove_at_expressions(col_spec)
     col_spec_clean = col_spec_clean.replace("|", "")
 
-    tokens = re.findall(
-        r"p\{([\d.]+)\\textwidth\}"   # p{0.XX\textwidth}
-        r"|m\{([\d.]+)\\textwidth\}"  # m{0.XX\textwidth}
-        r"|b\{([\d.]+)\\textwidth\}"  # b{0.XX\textwidth}
-        r"|X"                          # X (tabularx flexible)
-        r"|[lrcL]",                    # l r c or L
-        col_spec_clean
-    )
+    col_spec_clean = re.sub(r"[<>]\{(?:[^{}]|\{[^{}]*\})*\}", "", col_spec_clean)
+    tokens = re.finditer(r"[pmb]\{([^}]+)\}|[XlrcL]", col_spec_clean)
 
     cols = []
     for tok in tokens:
-        if isinstance(tok, tuple):
-            frac = tok[0] or tok[1] or tok[2]
-            if frac:
-                cols.append(float(frac))
-            else:
-                cols.append(None)  # X / l / r / c
+        length = tok.group(1)
+        if length:
+            fraction = re.fullmatch(r"([\d.]*)\\(?:textwidth|linewidth)", length)
+            absolute = _parse_length(length) if fraction is None else None
+            cols.append(float(fraction.group(1) or 1) if fraction
+                        else (absolute.inches * 1440 / content_dxa if absolute is not None else None))
         else:
             cols.append(None)
 
@@ -1585,6 +1749,8 @@ def _parse_col_widths_dxa(col_spec: str, n_cols: int,
     fixed_total = sum(f for f in cols if f is not None)
     flex_count  = sum(1 for f in cols if f is None)
     remaining   = content_dxa - int(fixed_total * content_dxa)
+    if remaining < 0 or (flex_count and remaining < 500 * flex_count):
+        return [content_dxa // n_cols] * n_cols
     flex_each   = (remaining // flex_count) if flex_count else 0
 
     result = []
@@ -1594,10 +1760,11 @@ def _parse_col_widths_dxa(col_spec: str, n_cols: int,
         else:
             result.append(max(flex_each, 500))  # minimum 500 DXA
 
-    # Adjust rounding to match content width exactly
+    # Flexible columns absorb rounding; explicitly sized columns retain their width.
     diff = content_dxa - sum(result)
-    if result:
-        result[-1] += diff
+    if flex_count:
+        last_flexible = max(i for i, value in enumerate(cols) if value is None)
+        result[last_flexible] += diff
     return result
 
 
@@ -1659,6 +1826,11 @@ def apply_booktabs_style(table):
     
     for row_idx, row in enumerate(rows):
         for cell in row.cells:
+            # Sin espacio antes/después en los párrafos de celda: las filas
+            # deben quedar compactas como en la salida PDF de LaTeX.
+            for para in cell.paragraphs:
+                para.paragraph_format.space_before = Pt(0)
+                para.paragraph_format.space_after = Pt(0)
             tc = cell._tc
             tcPr = tc.get_or_add_tcPr()
             tcBorders = OxmlElement('w:tcBorders')
@@ -2157,17 +2329,26 @@ def _parse_graphics_size(opts_str: str, img_path: Path):
             frac = float(m.group(1)) if m.group(1) else 1.0
             width = frac * TEXT_WIDTH_INCHES
         else:
-            m = re.search(r"width=([\d.]+)cm", opts_str)
+            # width = fraction of a custom length (e.g. \espacioRestante):
+            # approximate with the same fraction of the remaining text area
+            # (see REMAINING_SPACE_FACTOR) so the image stays bounded instead
+            # of falling back to natural size
+            m = re.search(r"width=([\d.]*)\\[a-zA-Z@]+", opts_str)
             if m:
-                width = float(m.group(1)) / 2.54
+                frac = float(m.group(1)) if m.group(1) else 1.0
+                width = frac * TEXT_WIDTH_INCHES * REMAINING_SPACE_FACTOR
             else:
-                m = re.search(r"width=([\d.]+)mm", opts_str)
+                m = re.search(r"width=([\d.]+)cm", opts_str)
                 if m:
-                    width = float(m.group(1)) / 25.4
+                    width = float(m.group(1)) / 2.54
                 else:
-                    m = re.search(r"width=([\d.]+)in", opts_str)
+                    m = re.search(r"width=([\d.]+)mm", opts_str)
                     if m:
-                        width = float(m.group(1))
+                        width = float(m.group(1)) / 25.4
+                    else:
+                        m = re.search(r"width=([\d.]+)in", opts_str)
+                        if m:
+                            width = float(m.group(1))
 
     # height = fraction \textheight (fraction optional, defaults to 1.0)
     m = re.search(r"height=([\d.]*)\\?textheight", opts_str)
@@ -2175,17 +2356,26 @@ def _parse_graphics_size(opts_str: str, img_path: Path):
         frac = float(m.group(1)) if m.group(1) else 1.0
         height = frac * TEXT_HEIGHT_INCHES
     else:
-        m = re.search(r"height=([\d.]+)cm", opts_str)
+        # height = fraction of a custom length (e.g. \espacioRestante):
+        # approximate with the same fraction of the remaining text area
+        # (see REMAINING_SPACE_FACTOR) so the image does not overflow the
+        # space actually available on the page
+        m = re.search(r"height=([\d.]*)\\[a-zA-Z@]+", opts_str)
         if m:
-            height = float(m.group(1)) / 2.54
+            frac = float(m.group(1)) if m.group(1) else 1.0
+            height = frac * TEXT_HEIGHT_INCHES * REMAINING_SPACE_FACTOR
         else:
-            m = re.search(r"height=([\d.]+)mm", opts_str)
+            m = re.search(r"height=([\d.]+)cm", opts_str)
             if m:
-                height = float(m.group(1)) / 25.4
+                height = float(m.group(1)) / 2.54
             else:
-                m = re.search(r"height=([\d.]+)in", opts_str)
+                m = re.search(r"height=([\d.]+)mm", opts_str)
                 if m:
-                    height = float(m.group(1))
+                    height = float(m.group(1)) / 25.4
+                else:
+                    m = re.search(r"height=([\d.]+)in", opts_str)
+                    if m:
+                        height = float(m.group(1))
 
     # scale
     m = re.search(r"scale=([\d.]+)", opts_str)
@@ -2903,10 +3093,13 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
     rows_data = _merge_complementary_header_rows(rows_data)
 
     if not col_widths_dxa or len(col_widths_dxa) != ncols:
-        col_widths_dxa = _parse_col_widths_dxa("", ncols)
+        col_widths_dxa = _parse_col_widths_dxa(col_spec, ncols, int(TEXT_WIDTH_INCHES * 1440))
 
     table = doc.add_table(rows=len(rows_data), cols=ncols)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = False
+    for column, width in zip(table.columns, col_widths_dxa):
+        column.width = Inches(width / 1440)
 
     header_row_idx = 0
 
@@ -2914,6 +3107,7 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
         tr = table.rows[ri]
         for ci in range(ncols):
             cell = tr.cells[ci]
+            cell.width = Inches(col_widths_dxa[ci] / 1440)
             cell_text = cells[ci] if ci < len(cells) else ""
             cell_text = re.sub(r"\\label\{[^}]*\}", "", cell_text)
             cell_text = re.sub(r"\\hspace\*?\{[^}]*\}", "", cell_text)
@@ -3003,6 +3197,34 @@ def _add_paragraph_safe(doc: Document, style: str | None = None):
         if style:
             print(f"  [WARN] Estilo '{style}' no encontrado en la plantilla; usando párrafo normal")
         return p
+
+
+def _disable_paragraph_numbering(p) -> None:
+    """Disable automatic list numbering inherited from the paragraph style.
+
+    Template heading styles may be linked to a numbering definition (e.g. the
+    "15." prefix of ``Heading 2``). Since the converter always writes the
+    section number manually from the LaTeX source, the style numbering must be
+    turned off per-paragraph with an explicit ``numId = 0`` override.
+    """
+    pPr = p._p.get_or_add_pPr()
+    numPr = pPr.find(qn("w:numPr"))
+    if numPr is None:
+        numPr = OxmlElement("w:numPr")
+        pStyle = pPr.find(qn("w:pStyle"))
+        if pStyle is not None:
+            pStyle.addnext(numPr)
+        else:
+            pPr.insert(0, numPr)
+    else:
+        for child in list(numPr):
+            numPr.remove(child)
+    ilvl = OxmlElement("w:ilvl")
+    ilvl.set(qn("w:val"), "0")
+    numId = OxmlElement("w:numId")
+    numId.set(qn("w:val"), "0")
+    numPr.append(ilvl)
+    numPr.append(numId)
 
 
 def _get_list_number_abstract_num_id(doc: Document):
@@ -3097,6 +3319,14 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
     if depth > 0:
         bullet_style = "List Bullet 2" if not ordered else "List Number 2"
 
+    # A reference template may not define the bullet styles; in that case the
+    # bullet is rendered manually (same approach as enumerate numbering).
+    try:
+        doc.styles[bullet_style]
+        bullet_style_available = True
+    except KeyError:
+        bullet_style_available = False
+
     # Split on \item boundaries, respecting nested itemize/enumerate
     items_raw = _split_items(inner)
     
@@ -3175,6 +3405,17 @@ def render_list(doc: Document, inner: str, ordered: bool = False, depth: int = 0
                         # Continuation paragraph: normal style, same indentation as list items, no number
                         p = doc.add_paragraph(style="Normal")
                         p.paragraph_format.left_indent = Inches(0.5 * (depth + 1))
+                    elif not ordered and not has_custom_label and not bullet_style_available:
+                        # Template lacks the bullet style: render the bullet
+                        # manually (mirrors LaTeX itemize output)
+                        p = doc.add_paragraph(style="Normal")
+                        p.paragraph_format.left_indent = Inches(0.5 * (depth + 1))
+                        p.paragraph_format.first_line_indent = Inches(-0.25)
+                        bullet_char = "•" if depth == 0 else "◦"
+                        run = p.add_run(f"{bullet_char}  ")
+                        run.font.name = FONT
+                        run.font.size = Pt(PT_NORM)
+                        run.font.color.rgb = C_BLACK
                     else:
                         p = _add_paragraph_safe(doc, para_style)
                         if has_custom_label:
@@ -3359,16 +3600,17 @@ def parse_body(doc: Document, source: str, base_dir: Path):
         add_title_page(doc, title_img_path, title_img_width, title_img_height, title_text, author_text, date_text)
         _safe_page_break(doc)
 
-    # ── Table of Contents ────────────────────────────────────────────────────
-    add_toc(doc)
-    _safe_page_break(doc)
-    
     # ── isolate the document body ─────────────────────────────────────────────
     begin_doc = re.search(r"\\begin\{document\}", source)
     end_doc   = re.search(r"\\end\{document\}",   source)
     if not begin_doc:
         return
     body = source[begin_doc.end(): end_doc.start() if end_doc else len(source)]
+    body = _resolve_macros(body)
+    # Layout controls must not swallow text that follows them on the same line.
+    body = re.sub(r"\\par\b", "\n\n", body)
+    body = re.sub(r"\\(?:penalty\s*-?\d+|selectfont\b)", "", body)
+    body = re.sub(r"\\vspace\*?\{[^}]*\}", "", body)
 
     # Remove \title, \author, \date blocks from body so _walk doesn't re-render them
     def _remove_cmd_block(cmd: str, text: str) -> str:
@@ -3400,6 +3642,12 @@ def parse_body(doc: Document, source: str, base_dir: Path):
 
     # ── resolve \\cite{...} to numbers ───────────────────────────────────────
     body = resolve_cites(body, bib_map)
+
+    # ── strip \ifdim...\fi conditional blocks ──────────────────────────────────
+    # They only manage pagination in the PDF (e.g. "\ifdim\espacioRestante<
+    # 0.6\textheight \clearpage \fi"). In Word they would inject spurious page
+    # breaks and leak comparison text like "<0.6" into the document.
+    body = re.sub(r"\\ifdim\b.*?\\fi\b", "", body, flags=re.DOTALL)
 
     # ── scan figures and tables for lists ────────────────────────────────────
     figures = pre_scan_figures(body)
@@ -3448,6 +3696,8 @@ _STRUCT = re.compile(
     r"|\\appendix\b"
     r"|\\maketitle\b|\\tableofcontents\b|\\listoffigures\b|\\listoftables\b"
     r"|\\includegraphics\b"
+    r"|\\fontsize\b"
+    r"|\\nopagebreak\b"
 )
 
 # Display math
@@ -3817,11 +4067,15 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
     fmt_italic = False
     fmt_size = PT_NORM
 
-    def flush():
+    def flush(tight: bool = False):
         nonlocal pending, fmt_bold, fmt_italic, fmt_size
         raw = " ".join(pending).strip()
         if raw:
-            _add_para(doc, raw, init_bold=fmt_bold, init_italic=fmt_italic, init_size=fmt_size)
+            p = _add_para(doc, raw, init_bold=fmt_bold, init_italic=fmt_italic, init_size=fmt_size)
+            if tight and p is not None:
+                # \\ / \newline are line breaks inside a LaTeX paragraph, so the
+                # generated line must not carry inter-paragraph spacing.
+                p.paragraph_format.space_after = Pt(0)
             # Propagate bold/italic, but reset size between paragraphs.
             # LaTeX size switches (\small, \footnotesize, ...) are scoped to
             # their paragraph/group and must not leak into the rest of the document.
@@ -3888,8 +4142,31 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
             pos += pb.end()
             continue
 
-        # Skip \maketitle, \tableofcontents (already handled)
-        skip = re.match(r"\\(?:maketitle|tableofcontents)\b", text[pos:])
+        # Keep paragraph grouping and render explicitly requested controls.
+        no_break = re.match(r"\\nopagebreak(?:\[[^\]]*\])?", text[pos:])
+        if no_break:
+            flush()
+            if doc.paragraphs:
+                doc.paragraphs[-1].paragraph_format.keep_with_next = True
+            pos += no_break.end()
+            continue
+
+        toc = re.match(r"\\tableofcontents\b", text[pos:])
+        if toc:
+            flush()
+            add_toc(doc)
+            _safe_page_break(doc)
+            pos += toc.end()
+            continue
+
+        font = re.match(r"\\fontsize\s*\{([\d.]+)\}\s*\{([\d.]+)\}", text[pos:])
+        if font:
+            flush()
+            fmt_size = float(font.group(1))
+            pos += font.end()
+            continue
+
+        skip = re.match(r"\\maketitle\b", text[pos:])
         if skip:
             pos += skip.end()
             continue
@@ -3986,12 +4263,19 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 level = {"section": 1, "subsection": 2,
                          "subsubsection": 3, "paragraph": 4}[cmd]
                 sizes = [16, 14, 12, 11]
+
+            # Numbering always comes from LaTeX (manual). When using a template,
+            # the template's heading styles may carry their own automatic
+            # numbering (e.g. "15."), which would duplicate ours — so it is
+            # explicitly disabled on each heading paragraph (numId = 0).
             num_str = "" if starred else format_section_number(cmd)
 
             # Create heading with number - use explicit style for TOC recognition
             full_title = f"{num_str}  {htxt}".strip()
             style_name = f"Heading {level}"
             p = _add_paragraph_safe(doc, style_name)
+            if TEMPLATE_PATH:
+                _disable_paragraph_numbering(p)
             run = p.add_run(full_title)
             run.font.name = FONT
             run.font.size = Pt(sizes[level-1])
@@ -4005,6 +4289,7 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
         if env_m:
             env_name = env_m.group(1)
             flush()
+            tables_before = len(doc.tables)
             result = extract_env(text, env_name, pos)
             if result is None:
                 pos += env_m.end()
@@ -4081,15 +4366,27 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 inner = _merge_pandas_index_header(inner)
                 render_table(doc, inner, caption="", col_spec=col_spec)
 
-            elif env_name == "center":
+            elif env_name in ("center", "flushright", "flushleft"):
                 n_para_before = len(doc.paragraphs)
                 n_tables_before = len(doc.tables)
                 _walk(doc, inner, base_dir)
-                # Center all paragraphs and tables added inside this center environment
+                # Apply the alignment of the enclosing environment.
                 for p in doc.paragraphs[n_para_before:]:
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    p.alignment = {"center": WD_ALIGN_PARAGRAPH.CENTER,
+                                   "flushright": WD_ALIGN_PARAGRAPH.RIGHT,
+                                   "flushleft": WD_ALIGN_PARAGRAPH.LEFT}[env_name]
                 for t in doc.tables[n_tables_before:]:
-                    t.alignment = WD_TABLE_ALIGNMENT.CENTER
+                    t.alignment = {"center": WD_TABLE_ALIGNMENT.CENTER,
+                                   "flushright": WD_TABLE_ALIGNMENT.RIGHT,
+                                   "flushleft": WD_TABLE_ALIGNMENT.LEFT}[env_name]
+
+            elif env_name == "samepage":
+                before = len(doc.paragraphs)
+                _walk(doc, inner, base_dir)
+                paragraphs = doc.paragraphs[before:]
+                for index, paragraph in enumerate(paragraphs):
+                    paragraph.paragraph_format.keep_together = True
+                    paragraph.paragraph_format.keep_with_next = index < len(paragraphs) - 1
 
             elif env_name == "tikzpicture":
                 tikz_code = r"\begin{tikzpicture}" + inner + r"\end{tikzpicture}"
@@ -4228,6 +4525,14 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
             else:
                 _walk(doc, inner, base_dir)
 
+            # A tabular is one unbreakable LaTeX block; longtable can span pages.
+            if env_name in ("table", "tabular", "tabularx"):
+                for table in doc.tables[tables_before:]:
+                    for row_index, row in enumerate(table.rows):
+                        for cell in row.cells:
+                            for paragraph in cell.paragraphs:
+                                paragraph.paragraph_format.keep_with_next = row_index < len(table.rows) - 1
+                                paragraph.paragraph_format.keep_together = True
             pos = end_pos
             continue
 
@@ -4297,21 +4602,48 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
             continue
 
         chunk = text[pos:stop]
-        # Convert LaTeX line breaks \\[...] to paragraph breaks
-        chunk = re.sub(r"\\\\(?:\[[^\]]*\])?", "\n\n", chunk)
-        # Convert LaTeX newlines to paragraph breaks
-        chunk = chunk.replace("\\newline", "\n\n")
+        # \\[<space>] requests explicit vertical space -> full paragraph break
+        chunk = re.sub(r"\\\\\[[^\]]*\]", "\n\n", chunk)
+        # \\ and \newline are simple line breaks inside a LaTeX paragraph ->
+        # marker handled below as a "tight" break (no inter-paragraph spacing)
+        chunk = re.sub(r"\\\\", "\x00NL\x00", chunk)
+        chunk = chunk.replace("\\newline", "\x00NL\x00")
         pos   = stop
+
+        # Expand lines, marking forced line breaks (\x00NL\x00). A forced break
+        # followed only by blank lines is a real paragraph end, not tight.
+        raw_lines = chunk.split("\n")
+        expanded: list[tuple[str, str | None]] = []
+        for idx, raw_line in enumerate(raw_lines):
+            parts = raw_line.split("\x00NL\x00")
+            for j, part in enumerate(parts):
+                if j < len(parts) - 1:
+                    rest = "\x00NL\x00".join(parts[j + 1:])
+                    following_blank = (
+                        not rest.strip()
+                        and all(not l.strip() for l in raw_lines[idx + 1:])
+                    )
+                    expanded.append((part, "para" if following_blank else "tight"))
+                else:
+                    expanded.append((part, None))
 
         # Collect non-empty lines
         _VAR_LINE = re.compile(r"^(\$[^$]+\$|\\(?:gls|Gls)\{[^}]*\})")
         prev_was_var = False
-        for line in chunk.split("\n"):
+        for line, brk in expanded:
             line = line.strip()
             if not line:
                 flush()
                 prev_was_var = False
                 continue
+            # Arg-less layout commands: drop the token but keep any text that
+            # follows it on the same line (e.g. "\noindent\textbf{...}").
+            # The skip-regex below matches "\b" after the command and would
+            # otherwise swallow the whole line, losing its text.
+            _no_layout = re.sub(r"\\(?:noindent|centering)\b\s*", "", line).strip()
+            if not _no_layout:
+                continue
+            line = _no_layout
             # skip pure layout/control commands
             if re.match(
                 r"\\(?:maketitle|tableofcontents|vspace|hspace|noindent|centering"
@@ -4321,7 +4653,10 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 r"|usepackage|documentclass|title|author|date"
                 r"|usetikzlibrary|tcbuselibrary|hypersetup|rowcolors"
                 r"|arrayrulecolor|cellcolor|newcounter|setcounter"
-                r"|newcommand|renewcommand|setlist)\b",
+                r"|newcommand|renewcommand|setlist"
+                # LaTeX conditionals for PDF page management (\ifdim...\fi)
+                # must not leak their comparison text (e.g. "<0.6") into Word
+                r"|ifdim|ifnum|ifx|else|fi)\b",
                 line
             ):
                 continue
@@ -4330,6 +4665,12 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 flush()
             pending.append(line)
             prev_was_var = is_var
+            if brk == "tight":
+                flush(tight=True)
+                prev_was_var = False
+            elif brk == "para":
+                flush()
+                prev_was_var = False
 
     flush()
 
@@ -4337,7 +4678,7 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
 def _maybe_add_tab_stop(para, text: str):
     """Add a tab stop if the cleaned text contains tab characters."""
     if "\t" in _clean(text):
-        para.paragraph_format.tab_stops.add_tab_stop(Inches(1.5))
+        para.paragraph_format.tab_stops.add_tab_stop(Inches(0.75))
 
 
 def _parse_leading_switches(text: str, bold: bool, italic: bool, size: int):
@@ -4417,10 +4758,14 @@ def _add_para(doc: Document, raw: str, init_bold=False, init_italic=False, init_
         )
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-        p.paragraph_format.space_after = Pt(12)
+        p.paragraph_format.space_after = Pt(CONFIG.paragraph_space_after)
         p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.line_spacing = CONFIG.line_spacing
         parse_inline(p, para_text, base_sz=PT_NORM,
                      bold=cur_bold, italic=cur_italic, size=cur_size)
+        if not p._p.xpath(".//w:t | .//m:t | .//w:drawing | .//w:fldChar"):
+            p._p.getparent().remove(p._p)
+            continue
         _maybe_add_tab_stop(p, para_text)
         last_p = p
     return last_p
@@ -4527,6 +4872,10 @@ def extract_tables_to_temp(source: str, temp_dir: Path) -> int:
         # con \begin{tabular}[c]{@{}c@{}}texto\end{tabular}).
         content = _flatten_single_cell_tabulars(content)
 
+        # Expandir \shortstack{A\\B} -> "A B": Pandoc no lo entiende y rompe
+        # los encabezados apilados en filas desplazadas perdiendo texto.
+        content = _expand_shortstack(content)
+
         # Fusionar encabezados divididos generados por pandas (índice con nombre).
         content = _merge_pandas_index_header(content)
 
@@ -4622,7 +4971,8 @@ def expand_inputs(source: str, base_dir: Path, root_dir: Path = None, depth: int
 
 
 def main():
-    global TEMP_DIR, PANDOC_PATH, CONFIG, PREAMBLE_GLOBAL
+    global TEMP_DIR, PANDOC_PATH, CONFIG, PREAMBLE_GLOBAL, TEMPLATE_PATH
+    global FONT, PT_NORM, PT_SMALL, PT_FOOT, TEXT_WIDTH_INCHES, TEXT_HEIGHT_INCHES
 
     in_path  = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("linea_base_en.tex")
     if len(sys.argv) > 2:
@@ -4636,10 +4986,12 @@ def main():
     # Optional third argument: path to a reference/template .docx whose styles,
     # page setup, header and footer should be preserved.
     template_path = None
+    TEMPLATE_PATH = None
     if len(sys.argv) > 3:
         candidate = Path(sys.argv[3])
         if candidate.exists():
             template_path = candidate
+            TEMPLATE_PATH = candidate
         else:
             print(f"[WARN] Plantilla no encontrada: {candidate}; se usará documento vacío.")
 
@@ -4661,18 +5013,26 @@ def main():
         source = expand_inputs(source, in_path.parent, root_dir=in_path.parent)
         print(f"[INFO] Inputs expandidos: {len(source)} caracteres")
 
-        # 1. Extraer tablas a carpeta temporal
-        print("[1/4] Extrayendo tablas...")
-        n_tables = extract_tables_to_temp(source, TEMP_DIR)
-        print(f"       {n_tables} tablas encontradas")
-
-        # 2. Parse preamble → populate MACROS and CONFIG
-        print("[2/4] Leyendo preámbulo...")
+        # 1. Parse preamble → populate MACROS and CONFIG
+        print("[1/4] Leyendo preámbulo...")
         preamble_end = source.find("\\begin{document}")
-        preamble = source[:preamble_end] if preamble_end != -1 else source
+        if preamble_end == -1 or r"\end{document}" not in source[preamble_end:]:
+            raise ValueError("El archivo debe contener \\begin{document} y \\end{document}.")
+        preamble = source[:preamble_end]
         PREAMBLE_GLOBAL = preamble
         parse_preamble(preamble, CONFIG)
         parse_geometry(preamble, CONFIG)
+        parse_text_settings(source, CONFIG)
+        FONT, PT_NORM = CONFIG.font_name, CONFIG.font_size_normal
+        PT_SMALL, PT_FOOT = CONFIG.font_size_small, CONFIG.font_size_foot
+        TEXT_WIDTH_INCHES = CONFIG.text_width_inches
+        TEXT_HEIGHT_INCHES = CONFIG.text_height_inches
+        OMML_CACHE.clear()
+        expanded_body = _resolve_macros(source[preamble_end:])
+        source = preamble + expanded_body
+        print("[2/4] Extrayendo tablas...")
+        n_tables = extract_tables_to_temp(expanded_body, TEMP_DIR)
+        print(f"       {n_tables} tablas encontradas")
 
         # 3. Find external tools
         CONFIG.pandoc_path = _find_executable("pandoc", [
@@ -4731,15 +5091,21 @@ def main():
             print(f"       Usando plantilla: {template_path}")
             doc = Document(str(template_path))
             # When a template is provided we keep its styles, page setup and
-            # header/footer. We still honour the LaTeX language for captions.
+            # header/footer, but clear any body content so it does not appear
+            # duplicated in the output.
+            body = doc.element.body
+            for child in list(body):
+                if child.tag != qn('w:sectPr'):
+                    body.remove(child)
+            # We still honour the LaTeX language for captions.
         else:
             doc = Document()
             setup_document(doc, CONFIG)
 
-            # Buscar logo
-            logo_path = _find_logo(in_path.parent, CONFIG)
-            add_header(doc, logo_path or Path("__missing_logo__"), header_text)
-            add_footer(doc)
+            if not add_latex_header_footer(doc, preamble, in_path.parent):
+                logo_path = _find_logo(in_path.parent, CONFIG)
+                add_header(doc, logo_path or Path("__missing_logo__"), header_text)
+                add_footer(doc)
 
         parse_body(doc, source, in_path.parent)
 

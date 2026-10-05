@@ -1,4 +1,6 @@
 @echo off
+setlocal
+cd /d "%~dp0"
 chcp 65001 >nul
 cls
 
@@ -17,25 +19,19 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-:: Crear entorno virtual si no existe
-if not exist "venv" (
-    echo Creando entorno virtual "venv"...
-    python -m venv venv
-    if %errorlevel% neq 0 (
-        echo [ERROR] No se pudo crear el entorno virtual.
-        pause
-        exit /b 1
-    )
-) else (
-    echo El entorno virtual "venv" ya existe.
+:: Crear o reparar un entorno local, sin reutilizar el venv de otro equipo.
+echo Configurando el entorno local ".venv"...
+python -m venv .venv
+if errorlevel 1 (
+    echo [ERROR] No se pudo configurar el entorno virtual.
+    pause
+    exit /b 1
 )
 
 :: Activar entorno e instalar/actualizar dependencias
 echo.
 echo Instalando dependencias en el entorno virtual...
-call venv\Scripts\activate.bat
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+".venv\Scripts\python.exe" -m pip install -r requirements.txt
 
 if %errorlevel% neq 0 (
     echo.
