@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from docx import Document
 from docx.text.paragraph import Paragraph
 from docx.shared import Pt, Inches, Cm, Mm, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement, parse_xml
@@ -163,6 +163,23 @@ REMAINING_SPACE_FACTOR = 0.8
 # ─────────────────────────────────────────────────────────────────────────────
 # XML helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+_TR_PR_ORDER = ("w:cantSplit", "w:trHeight", "w:tblHeader", "w:tblCellSpacing", "w:jc", "w:hidden")
+
+
+def _set_row_flag(row, tag: str):
+    """Add an on/off row property (w:cantSplit, w:tblHeader) in schema order."""
+    trPr = row._tr.get_or_add_trPr()
+    if trPr.find(qn(tag)) is not None:
+        return
+    flag = OxmlElement(tag)
+    later = _TR_PR_ORDER[_TR_PR_ORDER.index(tag) + 1:]
+    for child in trPr:
+        if child.tag in (qn(t) for t in later):
+            child.addprevious(flag)
+            return
+    trPr.append(flag)
+
 
 def _set_cell_bg(cell, hex_color: str):
     tc   = cell._tc
@@ -310,6 +327,21 @@ def _remove_empty_paragraphs_after_tables(doc: Document):
         sep.paragraph_format.space_after = Pt(12)
         sep.paragraph_format.space_before = Pt(0)
         sep.paragraph_format.line_spacing = 1.0
+        nxt = sep._p.getnext()
+        if nxt is None or nxt.tag == qn('w:sectPr'):
+            # Word needs a paragraph after a final table; keep it 1 pt high so
+            # a table that fills the last page does not push an empty page.
+            sep.paragraph_format.space_after = Pt(0)
+            sep.paragraph_format.line_spacing = Pt(1)
+            sep.paragraph_format.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+            mark = sep._p.get_or_add_pPr()
+            rpr = mark.find(qn('w:rPr'))
+            if rpr is None:
+                rpr = OxmlElement('w:rPr')
+                mark.append(rpr)
+            size = OxmlElement('w:sz')
+            size.set(qn('w:val'), '2')
+            rpr.append(size)
         compacted += 1
 
     if removed or added or compacted:
@@ -409,6 +441,8 @@ def add_table_caption(doc: Document, caption_text: str, table_num: int = 0,
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p.paragraph_format.space_before = Pt(6)
     p.paragraph_format.space_after = Pt(6)
+    # The caption precedes its table: never leave it alone at a page bottom.
+    p.paragraph_format.keep_with_next = True
 
     # Visible caption
     r = p.add_run(full_caption)
@@ -515,11 +549,19 @@ TEMPLATE_PATH: Path | None = None
 def _resolve_macros(text: str) -> str:
     r"""Expand document macros without discarding formatting or arguments."""
     # ponytail: bounded expansion, not a TeX interpreter; reject recursive macros.
+    def _separated(before: str, replacement: str) -> str:
+        # "\small\Programa" -> "\small Galapagos...", never "\smallGalapagos"
+        # (which would read as one unknown command and drop the first word).
+        if replacement[:1].isalpha() and re.search(r"\\[A-Za-z@]+$", before):
+            return " " + replacement
+        return replacement
+
     for _ in range(20):
         previous = text
         for key in sorted(MACROS, key=len, reverse=True):
             boundary = r"(?![A-Za-z@])" if key[-1].isalpha() else ""
-            text = re.sub(re.escape(key) + boundary, lambda m: MACROS[key], text)
+            text = re.sub(re.escape(key) + boundary,
+                          lambda m: _separated(m.string[:m.start()], MACROS[key]), text)
         for match in reversed(list(re.finditer(r"\\[A-Za-z@]+", text))):
             definition = MACRO_ARGS.get(match.group())
             if definition is None:
@@ -537,6 +579,7 @@ def _resolve_macros(text: str) -> str:
                 args.append(arg)
                 rest = rest[len(arg) + 2:].lstrip()
             replacement = re.sub(r"#([1-9])", lambda m: args[int(m.group(1)) - 1], body)
+            replacement = _separated(text[:match.start()], replacement)
             end = len(text) - len(rest)
             text = text[:match.start()] + replacement + " " + text[end:]
         if text == previous:
@@ -547,12 +590,50 @@ def _resolve_macros(text: str) -> str:
     raise ValueError("Las macros no terminan de expandirse; revise definiciones recursivas.")
 
 
+# Text-mode symbol commands (textcomp and LaTeX core) → Unicode.
+_TEXT_SYMBOLS = {
+    "textperthousand": "‰", "textpertenthousand": "‱", "textdegree": "°",
+    "textcelsius": "℃", "texttimes": "×", "textdiv": "÷", "textpm": "±",
+    "textmu": "µ", "texteuro": "€", "euro": "€", "textcent": "¢",
+    "textsterling": "£", "pounds": "£", "textyen": "¥", "textonehalf": "½",
+    "textonequarter": "¼", "textthreequarters": "¾", "textregistered": "®",
+    "texttrademark": "™", "textcopyright": "©", "copyright": "©",
+    "textsection": "§", "S": "§", "textparagraph": "¶", "dag": "†", "ddag": "‡",
+    "textellipsis": "…", "ldots": "…", "dots": "…", "textquotedblleft": "“",
+    "textquotedblright": "”", "textquoteleft": "‘", "textquoteright": "’",
+    "textendash": "–", "textemdash": "—", "textless": "<", "textgreater": ">",
+    "textbar": "|", "textunderscore": "_", "textasciitilde": "~",
+    "textasciicircum": "^", "textnumero": "№", "checkmark": "✓",
+    "textordfeminine": "ª", "textordmasculine": "º",
+}
+_TEXT_SYMBOL_RE = re.compile(
+    r"(?<!\\)\\(" + "|".join(sorted(_TEXT_SYMBOLS, key=len, reverse=True)) + r")(?![A-Za-z@])(?:\{\}|[ \t]*)"
+)
+
+
+def _thin_rule_as_line(m) -> str:
+    r"""\rule{w}{0.4pt} (signature or fill-in line) -> underscores of similar width."""
+    width, height = m.group(1).strip(), m.group(2)
+    if _rule_height_pt(height) > 1.5:
+        return m.group(0)   # thick rule: a bar, handled by the table renderer
+    fraction = re.fullmatch(r"([\d.]*)\s*\\(?:textwidth|linewidth|columnwidth|hsize)", width)
+    if fraction:
+        width_pt = float(fraction.group(1) or 1) * TEXT_WIDTH_INCHES * 72
+    else:
+        length = _parse_length(width)
+        width_pt = length.pt if length is not None else 144.0
+    return "_" * max(3, int(width_pt / 6))
+
+
 def _clean(text: str) -> str:
     """
     Convert LaTeX special chars/sequences to Unicode.
     Does NOT strip formatting commands — use strip_fmt() for plain text.
     """
     text = _resolve_macros(text)
+    text = re.sub(r"\\rule(?:\[[^\]]*\])?\{([^}]*)\}\{([^}]*)\}", _thin_rule_as_line, text)
+    # \textperthousand{}, \textdegree C, ... (TeX drops the space after a command word)
+    text = _TEXT_SYMBOL_RE.sub(lambda m: _TEXT_SYMBOLS[m.group(1)], text)
     # Note: font-size switches (\large, \normalsize, etc.) and font switches
     # (\bfseries, \normalfont) are now handled by parse_inline so they can
     # affect formatting. They are no longer stripped here.
@@ -768,8 +849,14 @@ def parse_inline(para, text: str, base_sz=PT_NORM, bold=False, italic=False, siz
         "Huge": 28,
     }
 
+    skip_space = False   # TeX ignores the spaces that follow a control word
     for m in _TOK.finditer(text):
         g0 = m.group(0)
+        if skip_space and m.group(10):
+            g0 = g0.lstrip()
+            if not g0:
+                continue
+        skip_space = bool(m.group(8))
         if m.group(1):   # \textbf
             inner_m = re.search(r"\\textbf\{((?:[^{}]|\{[^{}]*\})*)\}", g0)
             if inner_m:
@@ -1387,9 +1474,41 @@ def add_latex_header_footer(doc: Document, preamble: str, base_dir: Path) -> boo
     return True
 
 
+def _title_lines(raw: str) -> list[str]:
+    r"""Split \title{...} into its \\-separated lines without layout wrappers."""
+    raw = re.sub(r"\\(?:begin|end)\s*\{(?:center|flushleft|flushright)\}", "", raw)
+    raw = re.sub(r"\\(?:centering|noindent|par)\b|\\[vh]space\*?\{[^}]*\}", " ", raw)
+    lines = []
+    for line in _split_table_rows(raw):
+        line = line.strip()
+        # {\Large ...} as a whole line is just a group: unwrap it.
+        while line.startswith("{"):
+            inner = _extract_balanced_braces(line, 0)
+            if inner is None or len(inner) + 2 != len(line):
+                break
+            line = inner.strip()
+        if strip_fmt(line):
+            lines.append(line)
+    return lines
+
+
+def _has_separate_title_page(preamble: str) -> bool:
+    r"""True when \maketitle puts the title on its own page (report/book or titlepage)."""
+    m = re.search(r"\\documentclass\s*(?:\[([^\]]*)\])?\s*\{([^}]*)\}", preamble)
+    if not m:
+        return True
+    opts = [o.strip() for o in (m.group(1) or "").split(",")]
+    if "titlepage" in opts:
+        return True
+    if "notitlepage" in opts:
+        return False
+    return m.group(2).strip() in ("report", "book", "memoir", "scrreprt", "scrbook")
+
+
 def add_title_page(doc: Document, title_img_path: Path | None,
                    title_img_width: float | None, title_img_height: float | None,
-                   title: str, author: str, date_str: str):
+                   title: str, author: str, date_str: str,
+                   title_lines: list[str] | None = None):
     # Optional title image (e.g. \includegraphics inside \title)
     if title_img_path and title_img_path.exists():
         p = doc.add_paragraph()
@@ -1404,8 +1523,18 @@ def add_title_page(doc: Document, title_img_path: Path | None,
         p.add_run().add_picture(str(title_img_path), **kwargs)
         doc.add_paragraph()
 
-    # Main title text
-    if title:
+    # Main title text: one paragraph per \\ line. A line with its own size or
+    # bold command keeps it; a plain line uses the classic bold 16 pt title.
+    if title_lines and len(title_lines) > 1:
+        explicit = re.compile(r"\\(?:textbf|bfseries|tiny|scriptsize|footnotesize|small"
+                              r"|normalsize|large|Large|LARGE|huge|Huge)\b")
+        for line in title_lines:
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.paragraph_format.space_after = Pt(6)
+            parse_inline(p, line, base_sz=16, bold=not explicit.search(line))
+        doc.add_paragraph()
+    elif title:
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         _run(p, title, bold=True, size=16)
@@ -1543,6 +1672,203 @@ def _strip_column_spec(text: str):
             if depth == 0:
                 return text[1:i], text[i + 1:]
     return "", text
+
+
+# Environments whose first mandatory argument is the table width, not the
+# column spec: \begin{tabularx}{\textwidth}{...}, \begin{tabular*}{w}{...}.
+_WIDTH_ARG_TABULARS = ("tabularx", "tabulary", "xltabular")
+
+
+def _strip_tabular_args(env_name: str, inner: str, starred: bool = False):
+    """Return (col_spec, body) for a tabular-like environment.
+
+    tabularx/tabulary/xltabular and tabular* take a width argument before the
+    column spec; it must be skipped or the width is mistaken for the spec and
+    the real spec leaks into the first cell.
+    """
+    if env_name in _WIDTH_ARG_TABULARS or starred:
+        _, inner = _strip_column_spec(inner)
+    return _strip_column_spec(inner)
+
+
+def _expand_col_spec_repeats(col_spec: str) -> str:
+    r"""Expand the *{n}{spec} repetition syntax of LaTeX column specs."""
+    pattern = re.compile(r"\*\s*\{(\d+)\}\s*\{")
+    while True:
+        m = pattern.search(col_spec)
+        if not m:
+            return col_spec
+        body = _extract_balanced_braces(col_spec, m.end() - 1)
+        if body is None:
+            return col_spec
+        end = m.end() - 1 + len(body) + 2
+        col_spec = col_spec[:m.start()] + body * int(m.group(1)) + col_spec[end:]
+
+
+def _remove_column_prefixes(col_spec: str) -> str:
+    r"""Remove >{...} and <{...} column decorations (e.g. >{\centering\arraybackslash}).
+
+    Pandoc swallows the first token of every cell in such columns (a leading
+    "12" or "4" disappears), so they are removed before delegating to Pandoc.
+    """
+    return re.sub(r"[<>]\s*\{(?:[^{}]|\{[^{}]*\})*\}", "", col_spec)
+
+
+def _parse_col_aligns(col_spec: str, n_cols: int) -> list:
+    """Return the horizontal alignment of each column (WD_ALIGN_PARAGRAPH or None)."""
+    spec = _expand_col_spec_repeats(_remove_at_expressions(col_spec or "")).replace("|", "")
+    aligns = []
+    for tok in re.finditer(r"([<>])\s*\{((?:[^{}]|\{[^{}]*\})*)\}|[pmb]\{[^}]*\}|[XlrcL]", spec):
+        if tok.group(1) == ">":
+            prefix = tok.group(2)
+            aligns.append(("prefix", WD_ALIGN_PARAGRAPH.CENTER if "\\centering" in prefix
+                           else WD_ALIGN_PARAGRAPH.RIGHT if "\\raggedleft" in prefix
+                           else WD_ALIGN_PARAGRAPH.LEFT if "\\raggedright" in prefix else None))
+            continue
+        if tok.group(1) == "<":
+            continue
+        letter = tok.group(0)[0]
+        own = {"c": WD_ALIGN_PARAGRAPH.CENTER, "r": WD_ALIGN_PARAGRAPH.RIGHT,
+               "l": WD_ALIGN_PARAGRAPH.LEFT}.get(letter)
+        if aligns and aligns[-1][0] == "prefix":
+            own = aligns.pop()[1] or own
+        aligns.append(("col", own))
+    result = [a for kind, a in aligns if kind == "col"]
+    return result if len(result) == n_cols else [None] * n_cols
+
+
+def _scan_table_text(text: str, on_sep):
+    """Walk tabular text tracking brace and environment depth.
+
+    `on_sep(text, i)` is called at every top-level position and returns the
+    length of a separator found there (0 if none). Returns the pieces between
+    separators. Escaped characters (\\&, \\{, ...) never act as separators.
+    """
+    pieces, buf, depth, env_depth, i = [], [], 0, 0, 0
+    while i < len(text):
+        if depth == 0 and env_depth <= 0:
+            size = on_sep(text, i)
+            if size:
+                pieces.append("".join(buf))
+                buf = []
+                i += size
+                continue
+        c = text[i]
+        if c == "\\":
+            env = re.match(r"\\(begin|end)\s*\{[^}]*\}", text[i:])
+            if env:
+                env_depth += 1 if env.group(1) == "begin" else -1
+                buf.append(env.group(0))
+                i += env.end()
+                continue
+            buf.append(text[i:i + 2])
+            i += 2
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        buf.append(c)
+        i += 1
+    pieces.append("".join(buf))
+    return pieces
+
+
+def _split_table_cells(row: str) -> list[str]:
+    r"""Split a tabular row on its & column separators.
+
+    Escaped ampersands (O\&M) and separators nested in braces or inner
+    environments stay inside their cell.
+    """
+    return [c.strip() for c in _scan_table_text(row, lambda t, i: 1 if t[i] == "&" else 0)]
+
+
+_ROW_SEP = re.compile(r"\\\\\*?(?:\s*\[[^\]]*\])?|\\tabularnewline\b")
+
+
+def _split_table_rows(text: str) -> list[str]:
+    r"""Split tabular content into rows on top-level \\ (or \tabularnewline).
+
+    Line breaks inside braces (\makecell{a\\b}, \shortstack{...}) or nested
+    environments are kept inside their cell.
+    """
+    def sep(t, i):
+        if t[i] != "\\":
+            return 0
+        m = _ROW_SEP.match(t, i)
+        return m.end() - i if m else 0
+    return _scan_table_text(text, sep)
+
+
+_LEADING_RULES = re.compile(
+    r"^\s*(?:\\(?:toprule|midrule|bottomrule|hline|cline\s*\{[^}]*\}|cmidrule(?:\([^)]*\))?\s*\{[^}]*\})\s*)+"
+)
+
+
+def _rule_separates_first_rows(tab_inner: str) -> bool:
+    """True when a horizontal rule separates the first two content rows.
+
+    A rule after the first row marks it as the header; the next row is data
+    and must never be merged into the header as a "units" row.
+    """
+    seen = 0
+    rule_after_first = False
+    for chunk in _split_table_rows(tab_inner):
+        rules = _LEADING_RULES.match(chunk)
+        content = chunk[rules.end():] if rules else chunk
+        content = re.sub(r"\\(?:endfirsthead|endhead|endfoot|endlastfoot|addlinespace)\b", "", content)
+        if seen == 1 and rules:
+            rule_after_first = True
+        if content.strip():
+            seen += 1
+            if seen == 2:
+                return rule_after_first
+    return False
+
+
+def _flatten_longtable(inner: str) -> str:
+    r"""Turn a longtable body into the rows Word should show, in order.
+
+    Each of \endfirsthead, \endhead, \endfoot and \endlastfoot ends the rows
+    written since the previous marker. Word shows the table once: the first
+    head (or the head when there is no first head), the body and the last
+    foot. The repeated head and the page-break foot ("continued...") go.
+    """
+    markers = list(re.finditer(r"\\(endfirsthead|endhead|endfoot|endlastfoot)\b", inner))
+    if not markers:
+        return inner
+    sections = {}
+    prev = 0
+    for m in markers:
+        sections[m.group(1)] = inner[prev:m.start()]
+        prev = m.end()
+    head = sections.get("endfirsthead", sections.get("endhead", ""))
+    return "\n".join([head, inner[prev:], sections.get("endlastfoot", "")])
+
+
+def _rule_height_pt(height: str) -> float:
+    length = _parse_length(height)
+    return length.pt if length is not None else 0.0
+
+
+def _rule_fill(cell_text: str) -> str | None:
+    r"""Return a hex fill when a cell only holds a thick \rule (e.g. a Gantt bar).
+
+    Thin rules (<= 1.5 pt, e.g. signature lines) are not bars; _clean turns
+    them into a line of underscores instead.
+    """
+    m = re.fullmatch(
+        r"\s*(?:\\color\s*\{([^}]*)\}\s*)?\\rule(?:\[[^\]]*\])?\{[^}]*\}\{([^}]*)\}\s*",
+        cell_text,
+    )
+    if not m or _rule_height_pt(m.group(2)) <= 1.5:
+        return None
+    named = {"black": "000000", "gray": "808080", "grey": "808080", "darkgray": "404040",
+             "lightgray": "BFBFBF", "red": "FF0000", "blue": "0000FF", "green": "00A000"}
+    color = (m.group(1) or "black").strip()
+    if re.fullmatch(r"[0-9A-Fa-f]{6}", color):
+        return color.upper()
+    return named.get(color.split("!")[0], "000000")
 
 
 def _remove_at_expressions(col_spec: str) -> str:
@@ -1727,8 +2053,14 @@ def _parse_col_widths_dxa(col_spec: str, n_cols: int,
     col_spec_clean = _remove_at_expressions(col_spec)
     col_spec_clean = col_spec_clean.replace("|", "")
 
-    col_spec_clean = re.sub(r"[<>]\{(?:[^{}]|\{[^{}]*\})*\}", "", col_spec_clean)
+    col_spec_clean = _expand_col_spec_repeats(_remove_column_prefixes(col_spec_clean))
     tokens = re.finditer(r"[pmb]\{([^}]+)\}|[XlrcL]", col_spec_clean)
+
+    # LaTeX p{w} gives the text width of the column; the column itself also
+    # carries \tabcolsep (6pt unless set locally) on each side. Word cell widths
+    # include the cell margins, so the padding keeps the same usable text width.
+    pad_dxa = int(2 * TABCOLSEP_PT[0] * 20)
+    min_flex = 500
 
     cols = []
     for tok in tokens:
@@ -1736,8 +2068,12 @@ def _parse_col_widths_dxa(col_spec: str, n_cols: int,
         if length:
             fraction = re.fullmatch(r"([\d.]*)\\(?:textwidth|linewidth)", length)
             absolute = _parse_length(length) if fraction is None else None
-            cols.append(float(fraction.group(1) or 1) if fraction
-                        else (absolute.inches * 1440 / content_dxa if absolute is not None else None))
+            if fraction:
+                cols.append(float(fraction.group(1) or 1) * content_dxa + pad_dxa)
+            elif absolute is not None:
+                cols.append(absolute.inches * 1440 + pad_dxa)
+            else:
+                cols.append(None)
         else:
             cols.append(None)
 
@@ -1748,17 +2084,22 @@ def _parse_col_widths_dxa(col_spec: str, n_cols: int,
 
     fixed_total = sum(f for f in cols if f is not None)
     flex_count  = sum(1 for f in cols if f is None)
-    remaining   = content_dxa - int(fixed_total * content_dxa)
-    if remaining < 0 or (flex_count and remaining < 500 * flex_count):
-        return [content_dxa // n_cols] * n_cols
+    available   = content_dxa - min_flex * flex_count
+    if fixed_total > available and fixed_total > 0:
+        # Wider than the text block (LaTeX would overflow the margin): shrink
+        # the sized columns proportionally so their relative widths survive.
+        scale = max(available, 0) / fixed_total
+        cols = [f * scale if f is not None else None for f in cols]
+        fixed_total = sum(f for f in cols if f is not None)
+    remaining   = content_dxa - int(fixed_total)
     flex_each   = (remaining // flex_count) if flex_count else 0
 
     result = []
     for f in cols:
         if f is not None:
-            result.append(int(f * content_dxa))
+            result.append(int(f))
         else:
-            result.append(max(flex_each, 500))  # minimum 500 DXA
+            result.append(max(flex_each, min_flex))
 
     # Flexible columns absorb rounding; explicitly sized columns retain their width.
     diff = content_dxa - sum(result)
@@ -1778,23 +2119,70 @@ def _is_category_row(line: str) -> bool:
     return bool(re.match(r"\s*\\multicolumn\b", line.strip()) and "&" not in line)
 
 
-def _expand_multicolumn(line: str) -> str:
+_SPAN_MARK = re.compile(r"\x00SPAN(\d+)\|([^\x00]*)\x00")
+
+
+def _expand_multicolumn(line: str, mark: bool = False) -> str:
     r"""
     Replace \multicolumn{n}{align}{text} with (text)(& repeat n-1 times).
+
+    With mark=True the cell also carries a \x00SPAN<n>|<align>\x00 marker so
+    the renderer can merge the spanned Word cells.
     """
     def repl(m):
         n    = int(m.group(1))
         text = m.group(3)
-        return text + " & " * (n - 1)
+        marker = f"\x00SPAN{n}|{m.group(2)}\x00" if mark and n > 1 else ""
+        return marker + text + " & " * (n - 1)
 
     return re.sub(
-        r"\\multicolumn\{(\d+)\}\{([^}]*)\}\{((?:[^{}]|\{[^{}]*\})*)\}",
+        r"\\multicolumn\{(\d+)\}\{((?:[^{}]|\{[^{}]*\})*)\}\{((?:[^{}]|\{[^{}]*\})*)\}",
         repl, line
     )
 
 
 # Contador global de tablas para usar tablas Pandoc pre-generadas
 TABLE_COUNTER = [0]
+
+# \tabcolsep vigente para la tabla que se está renderizando (pt).
+TABCOLSEP_PT = [6.0]
+
+_TABCOLSEP_SET = re.compile(r"\\setlength\s*\{?\s*\\tabcolsep\s*\}?\s*\{([^}]*)\}")
+# What may sit between a local \setlength{\tabcolsep} and its table.
+_TABLE_PREFIX_NOISE = re.compile(
+    r"(?:\s|\\(?:begingroup|small|footnotesize|scriptsize|tiny|normalsize|centering|noindent)\b"
+    r"|\\renewcommand\s*\{?\\arraystretch\}?\s*\{[^}]*\}|\\setlength\s*\{?\\[A-Za-z]+\}?\s*\{[^}]*\})*"
+)
+
+
+def _local_tabcolsep_pt(before: str, inner_prefix: str) -> float | None:
+    r"""Return a \tabcolsep set just before a table, or inside its float.
+
+    Recognises "\begingroup\small\setlength{\tabcolsep}{3pt}\begin{longtable}"
+    and "\begin{table}...\setlength{\tabcolsep}{4pt}\begin{tabular}"; any other
+    text in between means the setting belongs to something else.
+    """
+    for scope in (inner_prefix, before):
+        matches = list(_TABCOLSEP_SET.finditer(scope))
+        if not matches:
+            continue
+        last = matches[-1]
+        tail = scope[last.end():]
+        if scope is before and _TABLE_PREFIX_NOISE.fullmatch(tail) is None:
+            continue
+        length = _parse_length(last.group(1).strip())
+        if length is not None:
+            return length.inches * 72.0
+    return None
+
+
+# Número visible de tabla: LaTeX solo numera las tablas con \caption.
+TABLE_CAPTION_COUNTER = [0]
+
+
+def _next_table_caption_number() -> int:
+    TABLE_CAPTION_COUNTER[0] += 1
+    return TABLE_CAPTION_COUNTER[0]
 
 # Contador global de figuras tikz
 TIKZ_COUNTER = [0]
@@ -1823,8 +2211,10 @@ def apply_booktabs_style(table):
         return
     
     num_rows = len(rows)
-    
+
     for row_idx, row in enumerate(rows):
+        # LaTeX never breaks a table row across pages.
+        _set_row_flag(row, "w:cantSplit")
         for cell in row.cells:
             # Sin espacio antes/después en los párrafos de celda: las filas
             # deben quedar compactas como en la salida PDF de LaTeX.
@@ -2057,9 +2447,9 @@ def _merge_pandas_index_header(text: str) -> str:
 
     def _data_cells(s: str):
         s = s.rstrip("\\").strip()
-        if "&" not in s:
+        cells = _split_table_cells(s)
+        if len(cells) < 2:
             return None
-        cells = [c.strip() for c in s.split("&")]
         # descartar celdas vacías al final
         while cells and not cells[-1]:
             cells.pop()
@@ -2107,15 +2497,20 @@ def _merge_pandas_index_header(text: str) -> str:
     return "\n".join(new_lines)
 
 
-def _merge_complementary_header_rows(rows_data: list[list[str]]) -> list[list[str]]:
+def _merge_complementary_header_rows(rows_data: list[list[str]],
+                                     separated: bool = False) -> list[list[str]]:
     """Merge the first two header rows when they look like a split header.
 
     pandas/DataFrame tables often emit headers across two rows: names on the
     first row and units or qualifiers on the second. If the first row already
     looks like a header (mostly non-empty) and the second row adds extra text
     in some columns, the two rows are merged into one with a space.
+
+    `separated` means a horizontal rule divides the two rows in the LaTeX
+    source: the second row is then data (e.g. a signature row with an empty
+    cell) and is never merged.
     """
-    if len(rows_data) < 2:
+    if len(rows_data) < 2 or separated:
         return rows_data
     first, second = rows_data[0], rows_data[1]
     if len(first) != len(second):
@@ -2684,7 +3079,7 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
         
         # Agregar caption si existe
         if caption:
-            add_table_caption(doc, caption, table_num)
+            add_table_caption(doc, caption, _next_table_caption_number())
         
         # Copiar primera tabla del archivo Pandoc
         source_table = pandoc_doc.tables[0]
@@ -2730,8 +3125,9 @@ def render_table_with_pandoc(doc: Document, tab_inner: str, caption: str = ""):
         if valid_rows:
             merged = [cell.text.strip() for cell in valid_rows[0].cells]
             format_cells = list(valid_rows[0].cells)
-            # Only attempt to merge the very next row with the header.
-            if len(valid_rows) > 1:
+            # Only attempt to merge the very next row with the header, and
+            # never across a rule (that row is data, not a units row).
+            if len(valid_rows) > 1 and not _rule_separates_first_rows(tab_inner):
                 next_texts = [cell.text.strip() for cell in valid_rows[1].cells]
                 if (len(next_texts) == len(merged) and
                         any(next_texts) and
@@ -2974,7 +3370,7 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
     if is_array:
         TABLE_COUNTER[0] += 1
         if caption:
-            add_table_caption(doc, caption, TABLE_COUNTER[0])
+            add_table_caption(doc, caption, _next_table_caption_number())
     elif not p_only and not has_inline_math and not complex_spec and render_table_with_pandoc(doc, tab_inner, caption):
         return
     elif p_only or has_inline_math or complex_spec:
@@ -2983,12 +3379,14 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
 
     # Fallback: manual rendering
     if caption and not is_array:
-        add_table_caption(doc, caption, TABLE_COUNTER[0])
+        add_table_caption(doc, caption, _next_table_caption_number())
 
-    # Clean tab_inner
-    cleaned_inner = re.sub(r"p\{[^}]*\}", "", tab_inner)
-    cleaned_inner = re.sub(r"m\{[^}]*\}", "", cleaned_inner)
-    cleaned_inner = re.sub(r"b\{[^}]*\}", "", cleaned_inner)
+    # A rule right after the first row marks it as the header row.
+    header_separated = _rule_separates_first_rows(tab_inner)
+
+    # Clean tab_inner: drop stray column-spec tokens (e.g. the p{3cm} of a
+    # \multicolumn alignment) but never letters inside commands such as \textup{}.
+    cleaned_inner = re.sub(r"(?<![A-Za-z\\])[pmb]\{[^}]*\}", "", tab_inner)
     # Flatten nested single-cell tabulars used for centred headers.
     cleaned_inner = _flatten_single_cell_tabulars(cleaned_inner)
 
@@ -3023,7 +3421,7 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
     else:
         # render_list may have replaced row separators with \x00NL\x00
         cleaned_inner = cleaned_inner.replace("\x00NL\x00", "\\\\")
-        raw_rows = re.split(r"\\\\", cleaned_inner)
+        raw_rows = _split_table_rows(cleaned_inner)
 
     def _restore_shortstack(m):
         idx = int(m.group(1))
@@ -3034,7 +3432,8 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
 
     rows_data = []
     is_header_row = []
-    
+    row_spans = []   # per row: list of (col, span, align) from \multicolumn
+
     for raw in raw_rows:
         raw = raw.strip()
         # Remove optional spacing arguments from \\[...] that ended up at row start
@@ -3057,31 +3456,38 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
         if not raw:
             continue
 
-        raw = _expand_multicolumn(raw)
-        cells = [c.strip() for c in raw.split("&")]
+        raw = _expand_multicolumn(raw, mark=True)
+        cells = _split_table_cells(raw)
         cells = [c for c in cells if not re.match(r"^p\{", c.strip())]
+        spans = []
+        for ci, cell_text in enumerate(cells):
+            span_m = _SPAN_MARK.search(cell_text)
+            if span_m:
+                spans.append((ci, int(span_m.group(1)), span_m.group(2)))
+                cells[ci] = _SPAN_MARK.sub("", cell_text).strip()
         # Remove only trailing empty cells; keep leading/middle empty cells
         # because they are needed for \multirow alignment
         while cells and not cells[-1].strip():
             cells.pop()
-        
+
         # Filtrar filas de continuación (longtable)
         if cells and is_continuation_row_cells(cells):
             continue
-        
+
         # Filtrar duplicados exactos
         if cells and is_duplicate_row(cells, [tuple(r) for r in rows_data]):
             continue
-        
+
         if cells:
             rows_data.append(cells)
             is_header_row.append(is_hdr)
+            row_spans.append(spans)
 
     if not rows_data:
         return
 
     ncols = ncols_hint or max(len(r) for r in rows_data)
-    
+
     for i, row in enumerate(rows_data):
         if len(row) < ncols:
             row.extend([""] * (ncols - len(row)))
@@ -3090,7 +3496,10 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
 
     # Merge two-row headers that are complementary (common in pandas/DataFrame
     # tables where the first row holds names and the second row holds units).
-    rows_data = _merge_complementary_header_rows(rows_data)
+    n_rows_before = len(rows_data)
+    rows_data = _merge_complementary_header_rows(rows_data, separated=header_separated)
+    if len(rows_data) < n_rows_before:
+        row_spans = [row_spans[0]] + row_spans[2:]
 
     if not col_widths_dxa or len(col_widths_dxa) != ncols:
         col_widths_dxa = _parse_col_widths_dxa(col_spec, ncols, int(TEXT_WIDTH_INCHES * 1440))
@@ -3102,6 +3511,7 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
         column.width = Inches(width / 1440)
 
     header_row_idx = 0
+    rule_fills = []   # (row, col, hex) for cells that only hold a \rule
 
     for ri, cells in enumerate(rows_data):
         tr = table.rows[ri]
@@ -3109,6 +3519,8 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
             cell = tr.cells[ci]
             cell.width = Inches(col_widths_dxa[ci] / 1440)
             cell_text = cells[ci] if ci < len(cells) else ""
+            # A line break in the LaTeX source is just a space inside a cell.
+            cell_text = re.sub(r"[ \t]*\n[ \t]*", " ", cell_text).strip()
             cell_text = re.sub(r"\\label\{[^}]*\}", "", cell_text)
             cell_text = re.sub(r"\\hspace\*?\{[^}]*\}", "", cell_text)
 
@@ -3137,6 +3549,13 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
 
                 # Sanitize any stray marker characters that leaked through
                 line = line.replace("\x00SJ\x00", "\\\\").replace("\x00NL\x00", "\\\\")
+
+                # A cell holding only \rule{w}{h} is a filled bar (Gantt charts):
+                # Word cannot draw the rule, so the cell is shaded instead.
+                fill = None if is_array else _rule_fill(line)
+                if fill:
+                    rule_fills.append((ri, ci, fill))
+                    continue
 
                 # En tablas array (\begin{array} en modo math), las celdas con
                 # ecuaciones se renderizan como imágenes PNG para que Word no las
@@ -3176,7 +3595,36 @@ def render_table(doc: Document, tab_inner: str, caption: str = "",
                     # font size instead of Word's default (larger) equation size.
                     _scale_omml_in_paragraph(p, PT_SMALL)
 
+    # \multicolumn spans become merged Word cells.
+    span_aligns = []
+    for ri, spans in enumerate(row_spans[:len(rows_data)]):
+        for ci, span, align in spans:
+            last = min(ci + span - 1, ncols - 1)
+            if last > ci:
+                span_aligns.append((table.cell(ri, ci).merge(table.cell(ri, last)), align))
+
     apply_booktabs_style(table)
+
+    # booktabs resets every paragraph to left: restore the alignment declared
+    # in the column spec (c, r, >{\centering}, >{\raggedleft}) and in \multicolumn.
+    if not is_array:
+        col_aligns = _parse_col_aligns(col_spec, ncols)
+        for row in table.rows:
+            for ci, cell in enumerate(row.cells):
+                if ci < len(col_aligns) and col_aligns[ci] is not None:
+                    for para in cell.paragraphs:
+                        para.alignment = col_aligns[ci]
+        for cell, align in span_aligns:
+            letter = re.search(r"[lcr]", re.sub(r"[<>]?\s*[pmb]?\{(?:[^{}]|\{[^{}]*\})*\}", "", align))
+            al = {"c": WD_ALIGN_PARAGRAPH.CENTER, "r": WD_ALIGN_PARAGRAPH.RIGHT}.get(
+                letter.group(0) if letter else "l", WD_ALIGN_PARAGRAPH.LEFT)
+            for para in cell.paragraphs:
+                para.alignment = al
+
+    # Shading goes after the borders so <w:shd> follows <w:tcBorders> in tcPr.
+    for ri, ci, fill in rule_fills:
+        _set_cell_bg(table.cell(ri, ci), fill)
+
     doc.add_paragraph()
 
 
@@ -3535,6 +3983,7 @@ def parse_body(doc: Document, source: str, base_dir: Path):
     
     # Reiniciar contadores
     TABLE_COUNTER[0] = 0
+    TABLE_CAPTION_COUNTER[0] = 0
     TIKZ_COUNTER[0] = 0
     FIGURE_COUNTER[0] = 0
 
@@ -3584,8 +4033,12 @@ def parse_body(doc: Document, source: str, base_dir: Path):
         # Remove the \includegraphics from title_raw for text extraction
         title_raw = title_raw[:img_m.start()] + title_raw[img_m.end():]
 
+    # Title lines as written (\\ separated), without layout wrappers such as
+    # \begin{center}; each line keeps its own size/bold commands.
+    title_lines = _title_lines(title_raw)
+
     # Use the full cleaned title text (no hardcoded defaults)
-    title_text = strip_fmt(title_raw).strip()
+    title_text = " ".join(strip_fmt(line) for line in title_lines).strip()
     # If title is empty after cleaning, try \textbf as fallback
     if not title_text:
         tb_m = re.search(r"\\textbf\{([^}]+)\}", title_raw)
@@ -3597,8 +4050,11 @@ def parse_body(doc: Document, source: str, base_dir: Path):
 
     has_title_content = bool(title_text or author_text or date_text or (title_img_path and title_img_path.exists()))
     if has_title_content:
-        add_title_page(doc, title_img_path, title_img_width, title_img_height, title_text, author_text, date_text)
-        _safe_page_break(doc)
+        add_title_page(doc, title_img_path, title_img_width, title_img_height, title_text, author_text, date_text,
+                       title_lines=title_lines)
+        # \maketitle only starts a new page for classes/options with a title page.
+        if _has_separate_title_page(PREAMBLE_GLOBAL):
+            _safe_page_break(doc)
 
     # ── isolate the document body ─────────────────────────────────────────────
     begin_doc = re.search(r"\\begin\{document\}", source)
@@ -3654,7 +4110,13 @@ def parse_body(doc: Document, source: str, base_dir: Path):
     tables = pre_scan_tables(body)
 
     # ── walk the body ─────────────────────────────────────────────────────────
-    _walk(doc, body, base_dir, figures, tables)
+    global SECTION_NUMBERING
+    SECTION_NUMBERING = _SectionNumbering(bool(re.search(r"\\chapter\b", body)),
+                                          _counter_formats_from(PREAMBLE_GLOBAL))
+    try:
+        _walk(doc, body, base_dir, figures, tables)
+    finally:
+        SECTION_NUMBERING = None
 
     # ── render bibliography ───────────────────────────────────────────────────
     if bib_inner is not None:
@@ -3693,7 +4155,7 @@ def strip_fancyhdr_cmds(text: str) -> str:
 # Significant structural tokens
 _STRUCT = re.compile(
     r"\\(?:chapter|section|subsection|subsubsection|paragraph|begin|end|newpage|clearpage)\*?\b"
-    r"|\\appendix\b"
+    r"|\\appendix\b|\\renewcommand\b"
     r"|\\maketitle\b|\\tableofcontents\b|\\listoffigures\b|\\listoftables\b"
     r"|\\includegraphics\b"
     r"|\\fontsize\b"
@@ -3702,6 +4164,103 @@ _STRUCT = re.compile(
 
 # Display math
 _DISP_MATH = re.compile(r"\\\[(.*?)\\\]", re.DOTALL)
+
+
+_SECTION_LEVELS = ("chapter", "section", "subsection", "subsubsection", "paragraph")
+
+# \renewcommand{\thesection}{...} (braces around the name are optional)
+_RENEW_THE = re.compile(
+    r"\\renewcommand\*?\s*(?:\{\s*\\the(chapter|section|subsection|subsubsection|paragraph)\s*\}"
+    r"|\\the(chapter|section|subsection|subsubsection|paragraph)\b)\s*\{"
+)
+
+
+def _format_counter(style: str, value: int) -> str:
+    if style == "Alph":
+        return _int_to_alpha(value, upper=True) if value > 0 else ""
+    if style == "alph":
+        return _int_to_alpha(value, upper=False) if value > 0 else ""
+    if style == "Roman":
+        return _int_to_roman(value, upper=True) if value > 0 else ""
+    if style == "roman":
+        return _int_to_roman(value, upper=False) if value > 0 else ""
+    return str(value)
+
+
+class _SectionNumbering:
+    r"""LaTeX sectioning counters shared by the label scan and the renderer.
+
+    Supports \appendix (resets the top counter and switches it to letters) and
+    \renewcommand{\the<level>}{...} templates such as "Annex \Alph{section}".
+    """
+
+    def __init__(self, has_chapters: bool, formats: dict | None = None):
+        self.has_chapters = has_chapters
+        self.counters = dict.fromkeys(_SECTION_LEVELS, 0)
+        self.formats = dict(formats or {})
+        self.appendix = False
+
+    def start_appendix(self):
+        self.appendix = True
+        top = "chapter" if self.has_chapters else "section"
+        for level in _SECTION_LEVELS[_SECTION_LEVELS.index(top):]:
+            self.counters[level] = 0
+        self.formats[top] = "\\Alph{" + top + "}"
+
+    def set_format(self, level: str, template: str):
+        self.formats[level] = template
+
+    def step(self, level: str):
+        self.counters[level] += 1
+        for lower in _SECTION_LEVELS[_SECTION_LEVELS.index(level) + 1:]:
+            self.counters[lower] = 0
+
+    def _default(self, level: str) -> str:
+        if level == "chapter":
+            return r"\arabic{chapter}"
+        if level == "section":
+            return r"\thechapter.\arabic{section}" if self.has_chapters else r"\arabic{section}"
+        parent = _SECTION_LEVELS[_SECTION_LEVELS.index(level) - 1]
+        return "\\the" + parent + ".\\arabic{" + level + "}"
+
+    def label(self, level: str, depth: int = 0) -> str:
+        template = self.formats.get(level) or self._default(level)
+        if depth > 5:
+            return ""
+        text = re.sub(
+            r"\\the(chapter|section|subsection|subsubsection|paragraph)\b",
+            lambda m: self.label(m.group(1), depth + 1), template)
+        text = re.sub(
+            r"\\(arabic|alph|Alph|roman|Roman)\s*\{(\w+)\}",
+            lambda m: _format_counter(m.group(1), self.counters.get(m.group(2), 0)), text)
+        text = text.replace("{", "").replace("}", "")
+        return re.sub(r"\s+", " ", text).strip()
+
+
+def _counter_formats_from(text: str) -> dict:
+    r"""Collect \renewcommand{\the<level>}{...} templates (e.g. from the preamble)."""
+    formats = {}
+    for m in _RENEW_THE.finditer(text):
+        body = _extract_balanced_braces(text, m.end() - 1)
+        if body is not None:
+            formats[m.group(1) or m.group(2)] = body
+    return formats
+
+
+# Active numbering for the document being converted (set in parse_body).
+SECTION_NUMBERING: "_SectionNumbering | None" = None
+
+
+def _iter_table_envs(text: str):
+    """Yield (start, end, inner) for table/table*/longtable in source order."""
+    last_end = -1
+    for m in re.finditer(r"\\begin\{(table|longtable)\*?\}", text):
+        if m.start() < last_end:
+            continue  # nested inside the previous table environment
+        result = extract_env(text, m.group(1), m.start())
+        if result:
+            last_end = result[1]
+            yield result
 
 
 def pre_scan_labels(text: str) -> dict:
@@ -3729,24 +4288,12 @@ def pre_scan_labels(text: str) -> dict:
         else:
             pos = idx + 1
 
-    # Tables
-    for env_name in ("table", "table*", "longtable"):
-        pos = 0
-        search_str = f"\\begin{{{env_name}}}"
-        while True:
-            idx = text.find(search_str, pos)
-            if idx == -1:
-                break
-            result = extract_env(text, env_name, idx)
-            if result:
-                _, end_pos, inner = result
-                if "\\caption{" in inner:
-                    table_counter += 1
-                    for label_m in re.finditer(r"\\label\{([^}]*)\}", inner):
-                        labels[label_m.group(1)] = str(table_counter)
-                pos = end_pos
-            else:
-                pos = idx + 1
+    # Tables: table, table* and longtable share one counter in source order.
+    for _, _, inner in _iter_table_envs(text):
+        if "\\caption{" in inner:
+            table_counter += 1
+            for label_m in re.finditer(r"\\label\{([^}]*)\}", inner):
+                labels[label_m.group(1)] = str(table_counter)
 
     # Equations (all types, in order of appearance)
     eq_counter = 0
@@ -3800,71 +4347,37 @@ def pre_scan_labels(text: str) -> dict:
                 labels[label_m.group(1)] = str(eq_counter)
             pos = dm.end()
 
-    # Section / chapter labels
-    sec_counters = {"chapter": 0, "section": 0, "subsection": 0, "subsubsection": 0, "paragraph": 0}
-    has_chapters = bool(re.search(r"\\chapter\b", text))
-    appendix_pos = text.find("\\appendix")
-
-    sec_matches = list(re.finditer(
-        r"\\(chapter|section|subsection|subsubsection|paragraph)\*?\s*\{[^{}]*\}",
+    # Section / chapter labels, following \appendix and \renewcommand{\the...}
+    # exactly as the renderer numbers the headings.
+    numbering = _SectionNumbering(bool(re.search(r"\\chapter\b", text)),
+                                  _counter_formats_from(PREAMBLE_GLOBAL))
+    events = list(re.finditer(
+        r"\\appendix\b"
+        r"|" + _RENEW_THE.pattern +
+        r"|\\(chapter|section|subsection|subsubsection|paragraph)(\*)?\s*\{(?:[^{}]|\{[^{}]*\})*\}",
         text
     ))
+    sec_events = [m for m in events if m.group(3)]
 
-    for i, m in enumerate(sec_matches):
-        cmd = m.group(1)
-        start_pos = m.end()
-        end_pos = sec_matches[i + 1].start() if i + 1 < len(sec_matches) else len(text)
-
-        if cmd == "chapter":
-            sec_counters["chapter"] += 1
-            sec_counters["section"] = 0
-            sec_counters["subsection"] = 0
-            sec_counters["subsubsection"] = 0
-            sec_counters["paragraph"] = 0
-        elif cmd == "section":
-            sec_counters["section"] += 1
-            sec_counters["subsection"] = 0
-            sec_counters["subsubsection"] = 0
-            sec_counters["paragraph"] = 0
-        elif cmd == "subsection":
-            sec_counters["subsection"] += 1
-            sec_counters["subsubsection"] = 0
-            sec_counters["paragraph"] = 0
-        elif cmd == "subsubsection":
-            sec_counters["subsubsection"] += 1
-            sec_counters["paragraph"] = 0
-        elif cmd == "paragraph":
-            sec_counters["paragraph"] += 1
-
-        appendix_mode = appendix_pos != -1 and m.start() > appendix_pos
-
-        if not has_chapters:
-            if cmd == "section":
-                num_str = f"{sec_counters['section']}"
-            elif cmd == "subsection":
-                num_str = f"{sec_counters['section']}.{sec_counters['subsection']}"
-            elif cmd == "subsubsection":
-                num_str = f"{sec_counters['section']}.{sec_counters['subsection']}.{sec_counters['subsubsection']}"
-            elif cmd == "paragraph":
-                num_str = f"{sec_counters['section']}.{sec_counters['subsection']}.{sec_counters['subsubsection']}.{sec_counters['paragraph']}"
-            else:
-                num_str = ""
-        else:
-            ch_label = chr(ord('A') + sec_counters['chapter'] - 1) if appendix_mode else str(sec_counters['chapter'])
-            if cmd == "chapter":
-                num_str = ch_label
-            elif cmd == "section":
-                num_str = f"{ch_label}.{sec_counters['section']}"
-            elif cmd == "subsection":
-                num_str = f"{ch_label}.{sec_counters['section']}.{sec_counters['subsection']}"
-            elif cmd == "subsubsection":
-                num_str = f"{ch_label}.{sec_counters['section']}.{sec_counters['subsection']}.{sec_counters['subsubsection']}"
-            elif cmd == "paragraph":
-                num_str = f"{ch_label}.{sec_counters['section']}.{sec_counters['subsection']}.{sec_counters['subsubsection']}.{sec_counters['paragraph']}"
-            else:
-                num_str = ""
+    for m in events:
+        if m.group(0).startswith("\\appendix"):
+            numbering.start_appendix()
+            continue
+        if m.group(1) or m.group(2):
+            body = _extract_balanced_braces(text, m.end() - 1)
+            if body is not None:
+                numbering.set_format(m.group(1) or m.group(2), body)
+            continue
+        cmd = m.group(3)
+        if m.group(4):
+            continue  # starred headings are not numbered
+        numbering.step(cmd)
+        num_str = numbering.label(cmd)
 
         # Look for the first \label within a short window after the section command
+        start_pos = m.end()
+        nxt = next((s for s in sec_events if s.start() > m.start()), None)
+        end_pos = nxt.start() if nxt else len(text)
         search_end = min(end_pos, start_pos + 300)
         label_m = re.search(r"\\label\{([^}]*)\}", text[start_pos:search_end])
         if label_m and label_m.group(1) not in labels:
@@ -3914,25 +4427,13 @@ def pre_scan_figures(text: str) -> list[tuple[int, str]]:
 def pre_scan_tables(text: str) -> list[tuple[int, str]]:
     """Return list of (number, plain_caption) for every table environment."""
     tables = []
-    for env_name in ("table", "table*", "longtable"):
-        pos = 0
-        search_str = f"\\begin{{{env_name}}}"
-        while True:
-            idx = text.find(search_str, pos)
-            if idx == -1:
-                break
-            result = extract_env(text, env_name, idx)
-            if result:
-                _, end_pos, inner = result
-                cap = _extract_caption_content(inner)
-                if cap is not None:
-                    cap_clean = strip_fmt(cap)
-                    cap_clean = re.sub(r"\\label\{[^}]*\}", "", cap_clean).strip()
-                    if cap_clean:
-                        tables.append((len(tables) + 1, cap_clean))
-                pos = end_pos
-            else:
-                pos = idx + 1
+    for _, _, inner in _iter_table_envs(text):
+        cap = _extract_caption_content(inner)
+        if cap is not None:
+            cap_clean = strip_fmt(cap)
+            cap_clean = re.sub(r"\\label\{[^}]*\}", "", cap_clean).strip()
+            if cap_clean:
+                tables.append((len(tables) + 1, cap_clean))
     return tables
 
 
@@ -4057,10 +4558,11 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
     """
     pending: list[str] = []
 
-    # Section / chapter counters
-    sec_counters = {"chapter": 0, "section": 0, "subsection": 0, "subsubsection": 0, "paragraph": 0}
-    appendix_mode = False
-    has_chapters = False
+    # Section / chapter counters (shared with pre_scan_labels so references
+    # and headings always agree; nested _walk calls reuse the same state).
+    numbering = SECTION_NUMBERING or _SectionNumbering(bool(re.search(r"\\chapter\b", text)))
+    appendix_mode = numbering.appendix
+    has_chapters = numbering.has_chapters
 
     # Current font state propagated across paragraph breaks
     fmt_bold = False
@@ -4083,32 +4585,8 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
         pending = []
     
     def format_section_number(cmd: str) -> str:
-        """Generate section number like 1, 1.1, 1.1.1, or A.1"""
-        ch = sec_counters['chapter']
-        if not has_chapters:
-            # No chapters → flat numbering as before
-            if cmd == "section":
-                return f"{sec_counters['section']}"
-            elif cmd == "subsection":
-                return f"{sec_counters['section']}.{sec_counters['subsection']}"
-            elif cmd == "subsubsection":
-                return f"{sec_counters['section']}.{sec_counters['subsection']}.{sec_counters['subsubsection']}"
-            elif cmd == "paragraph":
-                return f"{sec_counters['section']}.{sec_counters['subsection']}.{sec_counters['subsubsection']}.{sec_counters['paragraph']}"
-            return ""
-        # With chapters → hierarchical numbering
-        ch_label = chr(ord('A') + ch - 1) if appendix_mode else str(ch)
-        if cmd == "chapter":
-            return ch_label
-        elif cmd == "section":
-            return f"{ch_label}.{sec_counters['section']}"
-        elif cmd == "subsection":
-            return f"{ch_label}.{sec_counters['section']}.{sec_counters['subsection']}"
-        elif cmd == "subsubsection":
-            return f"{ch_label}.{sec_counters['section']}.{sec_counters['subsection']}.{sec_counters['subsubsection']}"
-        elif cmd == "paragraph":
-            return f"{ch_label}.{sec_counters['section']}.{sec_counters['subsection']}.{sec_counters['subsubsection']}.{sec_counters['paragraph']}"
-        return ""
+        """Generate section number like 1, 1.1, A.1 or a custom \\the<level>."""
+        return numbering.label(cmd)
 
     pos = 0
     n   = len(text)
@@ -4193,7 +4671,29 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
         app_m = re.match(r"\\appendix\b", text[pos:])
         if app_m:
             appendix_mode = True
+            numbering.start_appendix()
             pos += app_m.end()
+            continue
+
+        # \renewcommand: \the<level> templates change heading numbers; any other
+        # redefinition is consumed whole so its arguments never leak as text.
+        rc_m = re.match(r"\\renewcommand\*?\s*", text[pos:])
+        if rc_m:
+            flush()
+            j = pos + rc_m.end()
+            name_m = re.match(r"\{\s*(\\[A-Za-z@]+)\s*\}|(\\[A-Za-z@]+)", text[j:])
+            if name_m:
+                name = name_m.group(1) or name_m.group(2)
+                j += name_m.end()
+                opt_m = re.match(r"(?:\s*\[[^\]]*\])*\s*", text[j:])
+                j += opt_m.end()
+                body = _extract_balanced_braces(text, j)
+                if body is not None:
+                    j += len(body) + 2
+                    level_m = re.fullmatch(r"\\the(chapter|section|subsection|subsubsection|paragraph)", name)
+                    if level_m:
+                        numbering.set_format(level_m.group(1), body)
+            pos = j
             continue
         
         # Chapter headings
@@ -4205,11 +4705,8 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
             flush()
             _safe_page_break(doc)
             has_chapters = True
-            sec_counters["chapter"] += 1
-            sec_counters["section"] = 0
-            sec_counters["subsection"] = 0
-            sec_counters["subsubsection"] = 0
-            sec_counters["paragraph"] = 0
+            numbering.has_chapters = True
+            numbering.step("chapter")
             htxt = strip_fmt(ch_m.group(2))
             num_str = format_section_number("chapter")
             prefix = CONFIG.appendix_prefix if appendix_mode else CONFIG.chapter_prefix
@@ -4238,21 +4735,7 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
 
             # Starred versions (\section*) are not numbered and do not update counters
             if not starred:
-                # Update counters
-                if cmd == "section":
-                    sec_counters["section"] += 1
-                    sec_counters["subsection"] = 0
-                    sec_counters["subsubsection"] = 0
-                    sec_counters["paragraph"] = 0
-                elif cmd == "subsection":
-                    sec_counters["subsection"] += 1
-                    sec_counters["subsubsection"] = 0
-                    sec_counters["paragraph"] = 0
-                elif cmd == "subsubsection":
-                    sec_counters["subsubsection"] += 1
-                    sec_counters["paragraph"] = 0
-                elif cmd == "paragraph":
-                    sec_counters["paragraph"] += 1
+                numbering.step(cmd)
 
             # Get level and formatted number
             if has_chapters:
@@ -4296,6 +4779,13 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 continue
             _, end_pos, inner = result
 
+            # A local \setlength{\tabcolsep}{...} changes the column padding.
+            if env_name in ("table", "longtable", "tabular", "tabularx"):
+                tab_at = inner.find("\\begin{tabular") if env_name == "table" else -1
+                local_sep = _local_tabcolsep_pt(text[max(0, pos - 500):pos],
+                                                inner[:tab_at] if tab_at > 0 else "")
+                TABCOLSEP_PT[0] = local_sep if local_sep is not None else 6.0
+
             if env_name in ("itemize", "enumerate", "description"):
                 # Extract optional arguments like [label=..., leftmargin=...]
                 opt_arg, inner = _extract_optional_arg(inner)
@@ -4313,9 +4803,10 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 for tenv in ("tabularx", "tabular"):
                     tr = extract_env(inner, tenv)
                     if tr:
-                        _, _, tab_inner = tr
-                        # remove column spec: first {...}
-                        col_spec, tab_inner = _strip_column_spec(tab_inner)
+                        tab_start, _, tab_inner = tr
+                        starred = inner.startswith(f"\\begin{{{tenv}*}}", tab_start)
+                        # remove width argument (tabularx, tabular*) and column spec
+                        col_spec, tab_inner = _strip_tabular_args(tenv, tab_inner, starred)
                         # remove \resizebox wrapper
                         tab_inner = re.sub(r"\\resizebox\{[^}]*\}\{[^}]*\}\{?\s*", "", tab_inner)
                         tab_inner = re.sub(r"\s*\}?\s*$", "", tab_inner)
@@ -4335,13 +4826,13 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
             elif env_name == "longtable":
                 cap_txt = _extract_caption_content(inner)
                 caption = cap_txt if cap_txt is not None else ""
+                repeats_head = "\\endhead" in inner
                 # Fusionar encabezados divididos de pandas antes de cualquier otro procesamiento
                 inner = _merge_pandas_index_header(inner)
                 # strip column spec
                 col_spec, inner = _strip_column_spec(inner)
                 # strip \endfirsthead...\endhead  and  \endfoot...\endlastfoot
-                inner = re.sub(r"\\endfirsthead.*?\\endhead",     "", inner, flags=re.DOTALL)
-                inner = re.sub(r"\\endfoot.*?\\endlastfoot",       "", inner, flags=re.DOTALL)
+                inner = _flatten_longtable(inner)
                 inner = _remove_captions(inner)
                 # Remove labels that are no longer needed and any orphaned row
                 # separators left by caption/head removal.
@@ -4355,10 +4846,20 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                 )
                 inner = inner.strip()
                 render_table(doc, inner, caption, col_spec=col_spec)
+                # \endhead: the header row repeats on every page and is never
+                # left alone at the bottom of a page.
+                if repeats_head:
+                    for table in doc.tables[tables_before:]:
+                        if table.rows:
+                            _set_row_flag(table.rows[0], "w:tblHeader")
+                            for cell in table.rows[0].cells:
+                                for paragraph in cell.paragraphs:
+                                    paragraph.paragraph_format.keep_with_next = True
 
             elif env_name in ("tabular", "tabularx"):
                 # tabular/tabularx directo (sin \begin{table} wrapper)
-                col_spec, inner = _strip_column_spec(inner)
+                starred = text.startswith(f"\\begin{{{env_name}*}}", pos)
+                col_spec, inner = _strip_tabular_args(env_name, inner, starred)
                 # remove \resizebox wrapper
                 inner = re.sub(r"\\resizebox\{[^}]*\}\{[^}]*\}\{?\s*", "", inner)
                 inner = re.sub(r"\s*\}?\s*$", "", inner)
@@ -4533,6 +5034,7 @@ def _walk(doc: Document, text: str, base_dir: Path, figures: list[tuple[int, str
                             for paragraph in cell.paragraphs:
                                 paragraph.paragraph_format.keep_with_next = row_index < len(table.rows) - 1
                                 paragraph.paragraph_format.keep_together = True
+            TABCOLSEP_PT[0] = 6.0
             pos = end_pos
             continue
 
@@ -4816,8 +5318,9 @@ def extract_tables_to_temp(source: str, temp_dir: Path) -> int:
                 for tenv in ("tabularx", "tabular"):
                     tr = extract_env(inner, tenv)
                     if tr:
-                        _, _, tab_inner = tr
-                        wrapper_tables.append((start, tenv, tab_inner))
+                        tab_start, _, tab_inner = tr
+                        env_key = tenv + ("*" if inner.startswith(f"\\begin{{{tenv}*}}", tab_start) else "")
+                        wrapper_tables.append((start, env_key, tab_inner))
                         found = True
                         break
                 if not found:
@@ -4845,7 +5348,8 @@ def extract_tables_to_temp(source: str, temp_dir: Path) -> int:
             start, end, inner = result
             inside_wrapper = any(ws <= start < we for ws, we in wrapper_ranges)
             if not inside_wrapper:
-                direct_tables.append((start, tenv, inner))
+                env_key = tenv + ("*" if source.startswith(f"\\begin{{{tenv}*}}", start) else "")
+                direct_tables.append((start, env_key, inner))
             pos = end
 
     # Ordenar todo por posición en el source
@@ -4861,12 +5365,21 @@ def extract_tables_to_temp(source: str, temp_dir: Path) -> int:
         content = content.rstrip("}")  # Remover el cierre del resizebox si existe
 
         # Normalizar el especificador de columnas: Pandoc no entiende bien @{} y
-        # genera una sola fila con todas las celdas. Se eliminan esos separadores
-        # antes de delegar la conversión a Pandoc.
+        # genera una sola fila con todas las celdas; con >{...} se come el primer
+        # token de cada celda. Se eliminan antes de delegar la conversión a Pandoc.
+        # tabularx/tabular* llevan antes el ancho, que no es el especificador.
+        starred = env_name.endswith("*")
+        env_name = env_name.rstrip("*")
+        width = ""
+        if env_name in _WIDTH_ARG_TABULARS or starred:
+            width, content = _strip_column_spec(content)
         col_spec, rest = _strip_column_spec(content)
         if col_spec:
-            clean_spec = _remove_at_expressions(col_spec)
+            clean_spec = _expand_col_spec_repeats(
+                _remove_column_prefixes(_remove_at_expressions(col_spec)))
             content = "{" + clean_spec + "}" + rest
+        if env_name in _WIDTH_ARG_TABULARS:
+            content = "{" + width + "}" + content
 
         # Aplanar tabulares anidados de una sola celda (ej. encabezados centrados
         # con \begin{tabular}[c]{@{}c@{}}texto\end{tabular}).

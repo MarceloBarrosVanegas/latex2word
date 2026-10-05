@@ -76,7 +76,9 @@ def check_conversion():
         assert question.paragraph_format.keep_together and question.paragraph_format.keep_with_next
         assert document.paragraphs[0].paragraph_format.line_spacing.pt == 12.6
         assert document.tables[0].cell(1, 1).text == "28\u202f%"
-        assert abs(document.tables[0].columns[1].width.mm - 30) < 0.1
+        # p{30mm} is the text width; Word's column also holds 2 x \tabcolsep (6pt).
+        pad_mm = 2 * 6 * 20 / 1440 * 25.4
+        assert abs(document.tables[0].columns[1].width.mm - (30 + pad_mm)) < 0.1
         assert document.tables[0].cell(0, 0).paragraphs[0].paragraph_format.keep_with_next
         assert not document.tables[0].cell(1, 0).paragraphs[0].paragraph_format.keep_with_next
         assert document.element.body.xpath(".//m:oMath")
@@ -139,7 +141,7 @@ Texto normal.
         assert converter._extract_balanced_braces(r"{a \{b\} {c}}", 0) == r"a \{b\} {c}"
         assert converter.strip_fmt(r"\vspace{5mm} Texto") == "Texto"
         widths = converter._parse_col_widths_dxa("p{30mm}p{35mm}", 2)
-        assert all(abs(width / 1440 * 25.4 - target) < 0.1 for width, target in zip(widths, (30, 35)))
+        assert all(abs(width / 1440 * 25.4 - (target + pad_mm)) < 0.1 for width, target in zip(widths, (30, 35)))
         for definitions, call in ((r"\newcommand{\loop}{\loop}", r"\loop"),
                                   (r"\newcommand{\need}[2]{#1 #2}", r"\need{one}")):
             converter.parse_preamble(definitions)
