@@ -12,3 +12,6 @@ expanded_debug.tex
 *.toc
 *.tmp
 *.bak
+
+# Copias de conflicto de OneDrive (nombre-EQUIPO.ext)
+*-DESKTOP-*
